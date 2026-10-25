@@ -165,6 +165,11 @@ Column {
     implicitHeight: Math.max(tabs.implicitHeight, presets.implicitHeight)
     Row {
       id: tabs
+      anchors.verticalCenter: parent.verticalCenter
+      // Centred while there is room, pushed left when the preset row needs it,
+      // so the two rows never overlap on a narrow dashboard tile.
+      x: Math.max(0, Math.min((parent.width - tabs.implicitWidth) / 2,
+                              parent.width - (presets.visible ? presets.width + Style.space(12) : 0) - tabs.implicitWidth))
       spacing: Style.space(2)
       Repeater {
         model: ["limits", "usage", "cost"]

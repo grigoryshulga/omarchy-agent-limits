@@ -68,7 +68,9 @@ USER_AGENT = "omarchy-agent-limits/1.0"
 PROVIDERS = ("opencode-go", "zai", "claude", "codex", "deepseek")
 NAMES = {
     "opencode-go": "OpenCode Go", "zai": "Z.AI Coding Plan",
-    "claude": "Claude Pro", "codex": "ChatGPT Plus", "deepseek": "DeepSeek API",
+    # The Codex quota is what a ChatGPT Plus subscription buys for coding, and
+    # that is the only ChatGPT number any API reports; name it for both.
+    "claude": "Claude Pro", "codex": "ChatGPT / Codex", "deepseek": "DeepSeek API",
 }
 SECRET_DEFAULTS = {"opencode-go": "OPENCODE_GO_API_KEY", "zai": "ZAI_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
 # The configured `secretKey` is tried first; these aliases cover the names the
