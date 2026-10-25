@@ -1,0 +1,1222 @@
+#!/usr/bin/env python3
+"""Secret-free LLM limits and local usage snapshot for Omarchy.
+
+Credentials come from Bitwarden Secrets Manager or existing environment/auth
+files. Only aggregate metrics and rate-limit state are written to the cache.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import datetime as dt
+import fcntl
+import json
+import select
+import math
+import re
+import os
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+HOME = Path.home()
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state"))
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share"))
+CONFIG = CONFIG_HOME / "omarchy/agent-limits.json"
+CACHE = STATE_HOME / "omarchy/agent-limits/data.json"
+AGENT_RECORDS = STATE_HOME / "omarchy/agents/usage"
+# DeepSeek publishes no usage API (only /user/balance), so requests and cost for
+# it come from the harness session logs that actually made the calls.
+PI_SESSIONS = HOME / ".pi/agent/sessions"
+# Only providers that bill a tracked account directly. A harness fronting a
+# shared proxy (litellm) or a subscription that Omarchy's own agent records
+# already cover (claude-bridge, openai-codex) is excluded to avoid double
+# counting the same request twice.
+PI_PROVIDERS = {"deepseek": "deepseek", "zai": "zai", "zhipu": "zai", "z-ai": "zai",
+                "opencode-go": "opencode-go", "opencode": "opencode-go"}
+ENV_FILES = tuple(CONFIG_HOME / "omarchy" / name for name in ("jira.env", "litellm.env", "agent-limits.env"))
+RUNTIME_DIR = Path(f"/run/user/{os.getuid()}/omarchy-agent-limits")
+TIMEOUT = 15
+# Claude Code and Codex publish their own rate limits, so the plugin reads them
+# from the source rather than from Omarchy's snapshot of it: a snapshot that the
+# updater did not refresh shows a window that already reset.
+CLAUDE_CONFIG = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_BETA = "oauth-2025-04-20"
+CODEX_RPC_TIMEOUT = 7
+# Neither probe is free: starting the app-server syncs its plugin list and runs
+# a git fetch, and Anthropic rate-limits its usage endpoint readily. A popup
+# reopened a minute later must not repeat either, so a recent answer is reused
+# and a failure is remembered for longer than a success.
+LIVE_LIMITS_STATE = RUNTIME_DIR / "live-limits.json"
+LIVE_LIMITS_TTL = {"claude": 300, "codex": 240}
+LIVE_LIMITS_BACKOFF = 600
+USER_AGENT = "omarchy-agent-limits/1.0"
+PROVIDERS = ("opencode-go", "zai", "claude", "codex", "deepseek")
+NAMES = {
+    "opencode-go": "OpenCode Go", "zai": "Z.AI Coding Plan",
+    "claude": "Claude Pro", "codex": "ChatGPT Plus", "deepseek": "DeepSeek API",
+}
+SECRET_DEFAULTS = {"opencode-go": "OPENCODE_GO_API_KEY", "zai": "ZAI_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+# The configured `secretKey` is tried first; these aliases cover the names the
+# same subscription is commonly filed under in a Bitwarden project (e.g. an
+# OpenCode Go key stored as a personal READ_ONLY key). Only the providers that
+# actually need a Bitwarden lookup are listed.
+SECRET_ALIASES = {
+    "opencode-go": ("OPENCODE_GO_API_KEY", "OPENCODE_ZEN_API_KEY", "READ_ONLY_OPENCODE_API_KEY"),
+    "zai": ("ZAI_API_KEY", "ZHIPUAI_API_KEY", "GLM_API_KEY"),
+    "deepseek": ("DEEPSEEK_API_KEY",),
+}
+
+
+class SyncError(RuntimeError):
+    """Safe error suitable for display; never contains a credential/body."""
+
+    def __init__(self, message: str, retry_after: float = 0) -> None:
+        super().__init__(message)
+        # Seconds the provider asked us to wait, when it said so.
+        self.retry_after = max(0.0, number(retry_after))
+
+
+def number(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+        return result if math.isfinite(result) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def integer(value: Any) -> int:
+    return int(number(value))
+
+
+def bounded_text(value: Any, length: int = 180) -> str:
+    return str(value or "")[:length]
+
+
+def read_json(path: Path, fallback: Any) -> Any:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return fallback
+
+
+def atomic_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
+    os.chmod(temp, 0o600)
+    temp.replace(path)
+
+
+def empty_metrics() -> dict[str, Any]:
+    return {"tokens": 0, "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+            "cost": 0.0, "priced": False, "requests": 0, "sessions": 0}
+
+
+def empty_provider(provider_id: str) -> dict[str, Any]:
+    return {"id": provider_id, "name": NAMES[provider_id], "plan": "", "limits": [],
+            "limitsSource": "", "balance": [], "today": empty_metrics(), "week": empty_metrics(),
+            "total": empty_metrics(), "days": [], "models": [], "status": "loading",
+            "error": "", "stale": False, "syncedAt": 0, "scope": "local"}
+
+
+def empty_cache() -> dict[str, Any]:
+    return {"schemaVersion": 1, "state": "loading", "syncedAt": 0,
+            "providers": [empty_provider(p) for p in PROVIDERS], "error": ""}
+
+
+def load_config() -> dict[str, Any]:
+    example = Path(__file__).resolve().parent.parent / "config.example.json"
+    config = read_json(CONFIG, {})
+    if not isinstance(config, dict):
+        config = {}
+    defaults = read_json(example, {"providers": {}, "pricing": {}})
+    config.setdefault("providers", {})
+    config.setdefault("pricing", defaults.get("pricing", {}))
+    for provider in PROVIDERS:
+        entry = config["providers"].setdefault(provider, {})
+        entry.setdefault("enabled", True)
+        if provider in SECRET_DEFAULTS:
+            entry.setdefault("secretKey", SECRET_DEFAULTS[provider])
+    return config
+
+
+def merge_metrics(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key in ("tokens", "input", "output", "cacheRead", "cacheWrite", "requests", "sessions"):
+        target[key] = integer(target.get(key)) + integer(source.get(key))
+    target["cost"] = number(target.get("cost")) + number(source.get("cost"))
+    target["priced"] = bool(target.get("priced")) or bool(source.get("priced"))
+
+
+def metrics_from_usage(usage: dict[str, Any], requests: int = 0, sessions: int = 0) -> dict[str, Any]:
+    result = empty_metrics()
+    result.update({
+        "input": integer(usage.get("inputTokens", usage.get("input"))),
+        "output": integer(usage.get("outputTokens", usage.get("output"))),
+        "cacheRead": integer(usage.get("cacheReadInputTokens", usage.get("cacheRead"))),
+        "cacheWrite": integer(usage.get("cacheCreationInputTokens", usage.get("cacheWrite"))),
+        "requests": requests, "sessions": sessions,
+    })
+    result["tokens"] = result["input"] + result["output"] + result["cacheRead"] + result["cacheWrite"]
+    return result
+
+
+def price_model(model: str, usage: dict[str, Any], pricing: dict[str, Any]) -> float:
+    rates = pricing.get(model)
+    if not isinstance(rates, dict):
+        # Longest suffix/prefix alias is deliberately avoided: silently applying
+        # another model's prices is worse than honestly reporting "unpriced".
+        return -1.0
+    amount = 0.0
+    for field, rate_key in (("inputTokens", "input"), ("outputTokens", "output"),
+                            ("cacheReadInputTokens", "cacheRead"), ("cacheCreationInputTokens", "cacheWrite")):
+        amount += integer(usage.get(field)) * number(rates.get(rate_key)) / 1_000_000
+    return amount
+
+
+def price_metrics(metrics: dict[str, Any], cost: float) -> None:
+    metrics["cost"] = max(0.0, cost)
+    metrics["priced"] = cost >= 0
+
+
+def day_from_ms(value: Any) -> str:
+    try:
+        return dt.datetime.fromtimestamp(number(value) / 1000).date().isoformat()
+    except (ValueError, OSError, OverflowError):
+        return ""
+
+
+def hours_series(hours: dict[int, dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """24 buckets for the current local day, so the chart can show today hourly."""
+    result = []
+    for hour in range(24):
+        value = (hours or {}).get(hour) or empty_metrics()
+        result.append({"hour": hour, "tokens": integer(value.get("tokens")), "cost": number(value.get("cost")),
+                       "requests": integer(value.get("requests")), "priced": bool(value.get("priced"))})
+    return result
+
+
+def days_series(days: dict[str, dict[str, Any]], count: int = 30) -> list[dict[str, Any]]:
+    today = dt.datetime.now().date()
+    result = []
+    for offset in range(count - 1, -1, -1):
+        key = (today - dt.timedelta(days=offset)).isoformat()
+        value = days.get(key, empty_metrics())
+        result.append({"date": key, "tokens": integer(value.get("tokens")), "cost": number(value.get("cost")),
+                       "requests": integer(value.get("requests")), "priced": bool(value.get("priced"))})
+    return result
+
+
+def model_rows(models: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for name, metrics in models.items():
+        row = dict(metrics)
+        row["name"] = name[:120]
+        rows.append(row)
+    rows.sort(key=lambda row: (number(row.get("cost")) if row.get("priced") else -1, integer(row.get("tokens"))), reverse=True)
+    return rows[:20]
+
+
+# A limit window that already reset describes the *previous* period. Omarchy's
+# agent records refresh every few hours, so a weekly window can look spent for
+# most of a day after it rolled over. Each label carries its own period, which
+# lets an expired window advance in whole periods and keep its phase.
+WINDOW_PERIODS = (
+    ("5-hour", dt.timedelta(hours=5)),
+    ("session", dt.timedelta(hours=5)),
+    ("7-day", dt.timedelta(days=7)),
+    ("weekly", dt.timedelta(days=7)),
+    ("monthly", dt.timedelta(days=30)),
+)
+
+
+def window_period(label: Any) -> dt.timedelta | None:
+    text = str(label or "").lower()
+    for token, period in WINDOW_PERIODS:
+        if token in text:
+            return period
+    # Codex names a window by its length ("5h window", "300m window"), so the
+    # period is read from the number rather than a fixed vocabulary.
+    for pattern, unit in ((r"(\d+)\s*h(?:our)?s?\b", "hours"), (r"(\d+)\s*m(?:in)?s?\b", "minutes")):
+        match = re.search(pattern, text)
+        if match and int(match.group(1)) > 0:
+            return dt.timedelta(**{unit: int(match.group(1))})
+    return None
+
+
+def parse_moment(value: Any) -> dt.datetime | None:
+    text = bounded_text(value, 60)
+    if not text:
+        return None
+    try:
+        moment = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=dt.timezone.utc)
+
+
+def roll_expired_limits(provider: dict[str, Any], now: dt.datetime | None = None) -> None:
+    moment = now or dt.datetime.now(dt.timezone.utc)
+    limits = provider.get("limits")
+    if not isinstance(limits, list):
+        return
+    for limit in limits:
+        reset = parse_moment(limit.get("resetsAt"))
+        if reset is None or reset > moment:
+            continue
+        period = window_period(limit.get("label"))
+        limit["percent"] = 0.0
+        limit["remaining"] = 100.0
+        limit["exhausted"] = False
+        if "used" in limit:
+            limit["used"] = 0.0
+        if period is None or period.total_seconds() <= 0:
+            limit["resetsAt"] = ""
+            continue
+        steps = int((moment - reset) / period) + 1
+        limit["resetsAt"] = (reset + period * steps).isoformat()
+        limit["rolledWindows"] = max(1, steps)
+
+
+def finalize_provider(provider: dict[str, Any], days: dict[str, dict[str, Any]], models: dict[str, dict[str, Any]],
+                      hours: dict[int, dict[str, Any]] | None = None) -> None:
+    today = dt.date.today().isoformat()
+    week_start = (dt.date.today() - dt.timedelta(days=6)).isoformat()
+    provider["today"] = days.get(today, empty_metrics())
+    week = empty_metrics()
+    total = empty_metrics()
+    for day, value in days.items():
+        merge_metrics(total, value)
+        if day >= week_start:
+            merge_metrics(week, value)
+    # Requests/sessions from native records are more accurate than reconstructed days.
+    for key in ("requests", "sessions"):
+        if provider["total"].get(key):
+            total[key] = provider["total"][key]
+    provider["week"] = week
+    provider["total"] = total
+    provider["days"] = days_series(days)
+    provider["models"] = model_rows(models)
+    provider["hours"] = hours_series(hours)
+    roll_expired_limits(provider)
+
+
+def record_limits(record: dict[str, Any]) -> list[dict[str, Any]]:
+    limits: list[dict[str, Any]] = []
+    for item in record.get("limits") if isinstance(record.get("limits"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        limits.append(limit_row(bounded_text(item.get("label"), 60), number(item.get("percent")) * 100, item.get("resetsAt")))
+    return limits
+
+
+def moment_iso(value: Any) -> str:
+    """Epoch seconds/milliseconds or an ISO string as a UTC ISO timestamp."""
+    text = bounded_text(value, 60)
+    if not text:
+        return ""
+    if text.isdigit():
+        seconds = number(text)
+        if seconds > 10_000_000_000:
+            seconds /= 1000.0
+        try:
+            return dt.datetime.fromtimestamp(seconds, dt.timezone.utc).isoformat()
+        except (ValueError, OSError, OverflowError):
+            return ""
+    moment = parse_moment(text)
+    return moment.astimezone(dt.timezone.utc).isoformat() if moment else ""
+
+
+def limit_row(label: str, percent: float, resets_at: Any) -> dict[str, Any]:
+    pct = max(0.0, min(100.0, percent))
+    return {"label": label, "percent": pct, "remaining": 100 - pct,
+            "resetsAt": moment_iso(resets_at), "exhausted": pct >= 100}
+
+
+def claude_limits(payload: Any) -> list[dict[str, Any]]:
+    """Anthropic's OAuth usage payload as rate limit rows."""
+    if not isinstance(payload, dict):
+        return []
+    scoped = [entry for entry in payload.get("limits") or [] if isinstance(entry, dict)] if isinstance(payload.get("limits"), list) else []
+    raw = [bucket.get("utilization") for bucket in (payload.get("five_hour"), payload.get("seven_day_oauth_apps"), payload.get("seven_day")) if isinstance(bucket, dict)]
+    raw += [entry.get("percent") for entry in scoped]
+    # One payload speaks one convention: a value at or above 1 means the payload
+    # is percent-scaled, so 1.0 reads as 1% rather than 100%.
+    percent_scale = any(number(value, -1) >= 1 for value in raw)
+
+    def percent(value: Any) -> float:
+        scaled = number(value, -1)
+        if scaled < 0:
+            return -1.0
+        return scaled if percent_scale or scaled > 1 else scaled * 100
+
+    limits: list[dict[str, Any]] = []
+    for bucket, label in ((payload.get("five_hour"), "Session (5-hour)"),
+                          (payload.get("seven_day_oauth_apps") or payload.get("seven_day"), "Weekly (7-day)")):
+        if isinstance(bucket, dict):
+            pct = percent(bucket.get("utilization"))
+            if pct >= 0:
+                limits.append(limit_row(label, pct, bucket.get("resets_at")))
+    seen = {row["label"] for row in limits}
+    # A model-scoped allowance only appears in this array, and it can be the
+    # tightest window of all, so it travels as its own row.
+    for entry in scoped:
+        scope = entry.get("scope") if isinstance(entry.get("scope"), dict) else {}
+        model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+        name = bounded_text(model.get("display_name") or model.get("id"), 40)
+        pct = percent(entry.get("percent"))
+        if not name or pct < 0:
+            continue
+        kind = str(entry.get("kind") or "").lower()
+        window = "Monthly" if "month" in kind else "Weekly" if ("week" in kind or "day" in kind) else "Session"
+        label = f"{name} {window}"
+        if label in seen:
+            continue
+        seen.add(label)
+        limits.append(limit_row(label, pct, entry.get("resets_at")))
+    return limits
+
+
+def claude_plan(login: dict[str, Any]) -> str:
+    subscription = str(login.get("subscriptionType") or "")
+    plan = subscription[:1].upper() + subscription[1:]
+    match = re.search(r"max_(\d+x)", str(login.get("rateLimitTier") or ""), re.IGNORECASE)
+    if match:
+        plan = (plan or "Max") + " " + match.group(1)
+    return bounded_text(plan, 40)
+
+
+def collect_claude_limits() -> tuple[list[dict[str, Any]], str]:
+    data = read_json(CLAUDE_CONFIG / ".credentials.json", {})
+    login = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    login = login if isinstance(login, dict) else {}
+    token = bounded_text(login.get("accessToken"), 400)
+    if not token:
+        raise SyncError("Claude Code is not signed in on this machine")
+    payload = request_json(CLAUDE_USAGE_URL, {"Authorization": f"Bearer {token}", "anthropic-beta": CLAUDE_BETA})
+    limits = claude_limits(payload)
+    if not limits:
+        raise SyncError("Anthropic returned no rate limits")
+    return limits, claude_plan(login)
+
+
+def codex_limits(rate_limits: Any) -> list[dict[str, Any]]:
+    if not isinstance(rate_limits, dict):
+        return []
+    limits: list[dict[str, Any]] = []
+    for key in ("primary", "secondary"):
+        window = rate_limits.get(key)
+        if not isinstance(window, dict) or window.get("usedPercent") is None:
+            continue
+        minutes = integer(window.get("windowDurationMins"))
+        if minutes == 10080:
+            label = "Weekly (7-day)"
+        elif minutes and minutes % 60 == 0:
+            label = f"{minutes // 60}h window"
+        elif minutes:
+            label = f"{minutes}m window"
+        else:
+            label = "Limit"
+        limits.append(limit_row(label, number(window.get("usedPercent")), window.get("resetsAt")))
+    spend = rate_limits.get("individualLimit")
+    if isinstance(spend, dict):
+        cap = number(spend.get("limit"))
+        if cap > 0:
+            limits.append(limit_row("Spend limit", number(spend.get("used")) / cap * 100, spend.get("resetsAt")))
+    return limits
+
+
+def codex_binary() -> str:
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(directory) / "codex"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return shutil.which("codex") or ""
+
+
+def codex_rpc(process: subprocess.Popen, request_id: int | None, method: str, params: dict[str, Any], timeout: float = CODEX_RPC_TIMEOUT) -> dict[str, Any]:
+    payload: dict[str, Any] = {"method": method, "params": params}
+    if request_id is not None:
+        payload["id"] = request_id
+    try:
+        process.stdin.write(json.dumps(payload) + "\n")
+        process.stdin.flush()
+    except OSError as exc:
+        raise SyncError("Codex app-server exited before answering") from exc
+    if request_id is None:
+        return {}
+    descriptor = process.stdout.fileno()
+    pending = b""
+    deadline = time.monotonic() + timeout
+    while True:
+        # The app-server can emit notifications in the same write as the reply,
+        # so lines are split here instead of blocking in readline().
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(message, dict) and message.get("id") == request_id:
+                return message
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SyncError("Codex did not answer the limits check")
+        ready, _, _ = select.select([descriptor], [], [], min(0.25, remaining))
+        if not ready:
+            if process.poll() is not None:
+                raise SyncError("Codex app-server exited before answering")
+            continue
+        chunk = os.read(descriptor, 65536)
+        if not chunk:
+            raise SyncError("Codex app-server exited before answering")
+        pending += chunk
+
+
+def collect_codex_limits() -> tuple[list[dict[str, Any]], str]:
+    binary = codex_binary()
+    if not binary:
+        raise SyncError("Codex CLI is not installed")
+    try:
+        process = subprocess.Popen([binary, "-s", "read-only", "-a", "on-request", "app-server"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True)
+    except OSError as exc:
+        raise SyncError("Codex app-server did not start") from exc
+    try:
+        codex_rpc(process, 1, "initialize", {"clientInfo": {"name": "omarchy-agent-limits", "version": "1"}}, CODEX_RPC_TIMEOUT)
+        codex_rpc(process, None, "initialized", {})
+        message = codex_rpc(process, 2, "account/rateLimits/read", {}, CODEX_RPC_TIMEOUT)
+    finally:
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+    error = message.get("error")
+    if isinstance(error, dict):
+        raise SyncError(bounded_text(error.get("message")) or "Codex refused the limits check")
+    result = message.get("result") if isinstance(message.get("result"), dict) else {}
+    rate_limits = result.get("rateLimits")
+    limits = codex_limits(rate_limits)
+    if not limits:
+        raise SyncError("Codex returned no rate limits")
+    raw_plan = str(rate_limits.get("planType") or "") if isinstance(rate_limits, dict) else ""
+    # The app-server names the tier in lower case ("plus"); the card shows it
+    # beside "Pro" and "Go", so it is capitalized like those.
+    plan = bounded_text(raw_plan[:1].upper() + raw_plan[1:], 40)
+    return limits, plan
+
+
+# Named, not referenced: the lookup goes through globals() so a test can
+# replace a collector without rebuilding the table.
+NATIVE_LIMIT_COLLECTORS = {"claude": "collect_claude_limits", "codex": "collect_codex_limits"}
+
+
+def live_limits_state() -> dict[str, Any]:
+    state = read_json(LIVE_LIMITS_STATE, {})
+    return state if isinstance(state, dict) else {}
+
+
+def remember_live_limits(provider_id: str, payload: dict[str, Any]) -> None:
+    state = live_limits_state()
+    state[provider_id] = payload
+    try:
+        atomic_json(LIVE_LIMITS_STATE, state)
+    except OSError:
+        # A cache that cannot be written only costs another probe.
+        pass
+
+
+def cached_live_limits(provider_id: str, now: float | None = None) -> tuple[list[dict[str, Any]], str, str, bool]:
+    """A recent answer for this provider: (limits, plan, error, is_cached)."""
+    state = live_limits_state().get(provider_id)
+    if not isinstance(state, dict):
+        return [], "", "", False
+    moment = time.time() if now is None else now
+    limits = state.get("limits")
+    if isinstance(limits, list) and limits:
+        age = moment - number(state.get("fetchedAt"))
+        if 0 <= age < LIVE_LIMITS_TTL.get(provider_id, 0):
+            return [limit for limit in limits if isinstance(limit, dict)], bounded_text(state.get("plan"), 40), "", True
+    # A provider that just refused is left alone for longer than one it
+    # answered, so a rate limit is not hammered by every refresh.
+    failed_at = number(state.get("failedAt"))
+    # A provider that named its own wait is believed over the default backoff.
+    backoff = max(LIVE_LIMITS_BACKOFF, number(state.get("retryAfter")))
+    if failed_at and 0 <= moment - failed_at < backoff:
+        return [], "", bounded_text(state.get("error"), 180) or "the provider did not answer the limits check", True
+    return [], "", "", False
+
+
+def native_limits(provider_id: str, now: float | None = None) -> tuple[list[dict[str, Any]], str, str]:
+    collector = globals().get(NATIVE_LIMIT_COLLECTORS.get(provider_id, ""))
+    if collector is None:
+        return [], "", ""
+    cached_limits, cached_plan, cached_error, cached = cached_live_limits(provider_id, now)
+    if cached:
+        return cached_limits, cached_plan, cached_error
+    try:
+        limits, plan = collector()
+    except SyncError as exc:
+        remember_live_limits(provider_id, {"failedAt": time.time() if now is None else now, "error": str(exc),
+                                           "retryAfter": exc.retry_after})
+        return [], "", str(exc)
+    remember_live_limits(provider_id, {"fetchedAt": time.time() if now is None else now, "plan": plan, "limits": limits})
+    return limits, plan, ""
+
+
+def native_provider(provider_id: str, config: dict[str, Any]) -> dict[str, Any]:
+    provider = empty_provider(provider_id)
+    record = read_json(AGENT_RECORDS / f"{provider_id}.json", {})
+    record = record if isinstance(record, dict) else {}
+    # The agent's own rate limits are asked for directly. Omarchy's record is a
+    # snapshot of the same numbers, and a snapshot the updater did not refresh
+    # still describes a window that has already reset.
+    live_limits, live_plan, limits_error = native_limits(provider_id)
+    if not record and not live_limits:
+        provider["status"] = "unavailable"
+        provider["error"] = limits_error or "Omarchy agent record is not available yet"
+        return provider
+    provider["plan"] = live_plan or bounded_text(record.get("tierLabel"), 40)
+    if live_limits:
+        provider["limits"] = live_limits
+        provider["limitsSource"] = "live"
+        provider["syncedAt"] = int(time.time() * 1000)
+    else:
+        provider["limits"] = record_limits(record)
+        provider["limitsSource"] = "record" if provider["limits"] else ""
+        provider["syncedAt"] = integer(record.get("limitsFetchedAt")) or int(number(record.get("updatedAt")) * 1000)
+        if isinstance(record.get("updatedAt"), str):
+            try:
+                provider["syncedAt"] = int(dt.datetime.fromisoformat(record["updatedAt"]).timestamp() * 1000)
+            except ValueError:
+                pass
+        provider["stale"] = bool(record.get("limitsStale")) or bool(provider["limits"])
+        if not provider["limits"]:
+            provider["error"] = limits_error or bounded_text(record.get("usageStatusText"))
+    days: dict[str, dict[str, Any]] = {}
+    for item in record.get("recentDays", []) if isinstance(record.get("recentDays"), list) else []:
+        day = bounded_text(item.get("date"), 10)
+        days[day] = empty_metrics()
+        days[day]["tokens"] = integer(item.get("messageCount"))
+    models: dict[str, dict[str, Any]] = {}
+    pricing = config.get("pricing", {})
+    for name, usage in (record.get("modelUsage") or {}).items():
+        if not isinstance(usage, dict):
+            continue
+        metrics = metrics_from_usage(usage)
+        cost = price_model(name, usage, pricing)
+        price_metrics(metrics, cost)
+        models[name] = metrics
+        # Native recentDays already contain daily token totals; do not divide an
+        # all-time model aggregate across days. Cost-by-day is available only
+        # for OpenCode's timestamped local ledger.
+    # Use the model aggregate as the all-time token/cost ledger.
+    all_models = empty_metrics()
+    for metrics in models.values():
+        merge_metrics(all_models, metrics)
+    # Daily cost is an estimate: recentDays carry only token totals while the model
+    # aggregate is all-time, so spread the all-time cost over all-time tokens and
+    # apply that rate to each day. The trend shape is exact, the rate is average.
+    total_tokens = integer(all_models.get("tokens"))
+    total_cost = number(all_models.get("cost")) if all_models.get("priced") else -1.0
+    rate = total_cost / total_tokens if total_tokens > 0 and total_cost >= 0 else -1.0
+    for day in days.values():
+        if rate >= 0:
+            price_metrics(day, integer(day.get("tokens")) * rate)
+        else:
+            day["priced"] = False
+    provider["total"] = all_models
+    provider["total"]["requests"] = integer(record.get("totalPrompts"))
+    provider["total"]["sessions"] = integer(record.get("totalSessions"))
+    finalize_provider(provider, days, models)
+    # finalize_provider sums only seven recent days for total; restore all time.
+    provider["total"] = all_models
+    provider["total"]["requests"] = integer(record.get("totalPrompts"))
+    provider["total"]["sessions"] = integer(record.get("totalSessions"))
+    today_usage = empty_metrics()
+    today_usage["tokens"] = integer(record.get("todayTotalTokens"))
+    today_usage["requests"] = integer(record.get("todayPrompts"))
+    today_usage["sessions"] = integer(record.get("todaySessions"))
+    if rate >= 0:
+        price_metrics(today_usage, today_usage["tokens"] * rate)
+    provider["today"] = today_usage
+    provider["status"] = "ready"
+    return provider
+
+
+def opencode_ledger(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    result = {p: {"days": {}, "models": {}, "total": empty_metrics(), "hours": {}} for p in ("opencode-go", "zai", "deepseek")}
+    database = DATA_HOME / "opencode/opencode.db"
+    if not database.is_file():
+        return result
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
+        cutoff = int((time.time() - 400 * 86400) * 1000)
+        rows = connection.execute("SELECT data, time_created FROM message WHERE time_created >= ?", (cutoff,))
+        aliases = {
+            "opencode-go": "opencode-go", "opencode_go": "opencode-go",
+            "zai-coding-plan": "zai", "zai": "zai", "zhipu": "zai",
+            "deepseek": "deepseek",
+        }
+        sessions: dict[str, set[str]] = {p: set() for p in result}
+        for (raw, created) in rows:
+            try:
+                message = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if message.get("role") != "assistant":
+                continue
+            provider_id = aliases.get(str(message.get("providerID", "")))
+            if not provider_id:
+                continue
+            tokens = message.get("tokens") or {}
+            cache = tokens.get("cache") or {}
+            usage = {"inputTokens": tokens.get("input"), "outputTokens": tokens.get("output"),
+                     "cacheReadInputTokens": cache.get("read"), "cacheCreationInputTokens": cache.get("write")}
+            metrics = metrics_from_usage(usage, requests=1)
+            model = bounded_text(message.get("modelID") or "unknown", 120)
+            recorded_cost = number(message.get("cost"), -1)
+            cost = recorded_cost if recorded_cost > 0 else price_model(model, usage, config.get("pricing", {}))
+            price_metrics(metrics, cost)
+            created_ms = (message.get("time") or {}).get("created") or created
+            day = day_from_ms(created_ms)
+            if not day:
+                continue
+            bucket = result[provider_id]
+            if day not in bucket["days"]:
+                bucket["days"][day] = empty_metrics()
+            merge_metrics(bucket["days"][day], metrics)
+            if model not in bucket["models"]:
+                bucket["models"][model] = empty_metrics()
+            merge_metrics(bucket["models"][model], metrics)
+            merge_metrics(bucket["total"], metrics)
+            if day == dt.date.today().isoformat() and created_ms:
+                moment = dt.datetime.fromtimestamp(integer(created_ms) / 1000.0)
+                merge_metrics(bucket["hours"].setdefault(moment.hour, empty_metrics()), metrics)
+            sessions[provider_id].add(bounded_text(message.get("sessionID"), 100))
+        connection.close()
+        # sessionID is not denormalized in some OpenCode versions; a second,
+        # read-only join supplies it without trusting message JSON paths.
+        for provider_id in result:
+            result[provider_id]["total"]["sessions"] = len(sessions[provider_id])
+    except (OSError, sqlite3.Error):
+        try:
+            connection.close()
+        except Exception:
+            pass
+    return result
+
+
+def pi_local_timestamp(value: Any) -> dt.datetime | None:
+    text = bounded_text(value, 40)
+    if len(text) < 10:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone()
+    return parsed
+
+
+def pi_timestamp_day(value: Any) -> str:
+    parsed = pi_local_timestamp(value)
+    return parsed.date().isoformat() if parsed else ""
+
+
+def pi_usage_cost(usage: dict[str, Any]) -> float:
+    """Recorded harness cost, or -1 when the harness did not price the turn."""
+    cost = usage.get("cost")
+    if isinstance(cost, dict):
+        return number(cost.get("total"), -1.0)
+    return -1.0
+
+
+def pi_ledger(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Usage recorded by pi session logs for accounts we can only see locally.
+
+    DeepSeek has no usage API, so the harness log is the only record of what
+    actually reached the account. Every assistant turn there carries the
+    provider, the model, the token counts and usually the cost the provider
+    returned, which keeps requests and spend exact rather than estimated.
+    """
+    result = {provider_id: {"days": {}, "models": {}, "total": empty_metrics(), "hours": {}}
+              for provider_id in ("opencode-go", "zai", "deepseek")}
+    pricing = config.get("pricing", {})
+    if not PI_SESSIONS.is_dir():
+        return result
+    sessions: dict[str, set[str]] = {provider_id: set() for provider_id in result}
+    try:
+        paths = sorted(PI_SESSIONS.rglob("*.jsonl"))
+    except OSError:
+        return result
+    for path in paths:
+        try:
+            handle = path.open(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                if '"assistant"' not in line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                message = item.get("message") if isinstance(item, dict) else None
+                if not isinstance(message, dict) or message.get("role") != "assistant":
+                    continue
+                provider_id = PI_PROVIDERS.get(bounded_text(message.get("provider"), 40).strip().lower())
+                if not provider_id:
+                    continue
+                usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+                tokens = integer(usage.get("totalTokens"))
+                recorded = pi_usage_cost(usage)
+                if tokens <= 0 and recorded <= 0:
+                    # Aborted or empty turn: not a billable request.
+                    continue
+                metrics = metrics_from_usage(usage, requests=1)
+                if tokens > 0:
+                    metrics["tokens"] = tokens
+                model = bounded_text(message.get("model") or "unknown", 120)
+                # price_model reads the *Tokens* key style; the metrics already
+                # hold the normalised counts, so price from those instead of
+                # re-deriving them from the harness payload.
+                normalised = {"inputTokens": metrics["input"], "outputTokens": metrics["output"],
+                              "cacheReadInputTokens": metrics["cacheRead"],
+                              "cacheCreationInputTokens": metrics["cacheWrite"]}
+                cost = recorded if recorded > 0 else price_model(model, normalised, pricing)
+                price_metrics(metrics, cost)
+                moment = pi_local_timestamp(item.get("timestamp"))
+                if not moment:
+                    continue
+                day = moment.date().isoformat()
+                bucket = result[provider_id]
+                merge_metrics(bucket["days"].setdefault(day, empty_metrics()), metrics)
+                merge_metrics(bucket["models"].setdefault(model, empty_metrics()), metrics)
+                merge_metrics(bucket["total"], metrics)
+                if day == dt.date.today().isoformat():
+                    merge_metrics(bucket["hours"].setdefault(moment.hour, empty_metrics()), metrics)
+                sessions[provider_id].add(path.name)
+    for provider_id, bucket in result.items():
+        bucket["total"]["sessions"] = len(sessions[provider_id])
+    return result
+
+
+def merge_ledger(target: dict[str, Any], source: dict[str, Any]) -> None:
+    """Add one ledger's days/models/totals into another (different traffic)."""
+    for date, metrics in (source.get("days") or {}).items():
+        merge_metrics(target["days"].setdefault(date, empty_metrics()), metrics)
+    for model, metrics in (source.get("models") or {}).items():
+        merge_metrics(target["models"].setdefault(model, empty_metrics()), metrics)
+    merge_metrics(target["total"], source.get("total") or empty_metrics())
+    for hour, metrics in (source.get("hours") or {}).items():
+        if hour not in target["hours"]:
+            target["hours"][hour] = empty_metrics()
+        merge_metrics(target["hours"][hour], metrics)
+
+
+def apply_ledger(provider: dict[str, Any], ledger: dict[str, Any]) -> None:
+    finalize_provider(provider, ledger["days"], ledger["models"], ledger.get("hours"))
+    # Preserve reconstructed all-time total rather than only the visible 30 days.
+    total = ledger["total"]
+    # A harness ledger counts sessions per file; the day reconstruction cannot.
+    total["sessions"] = integer(ledger["total"].get("sessions")) or integer(provider["total"].get("sessions"))
+    provider["total"] = total
+    provider["scope"] = "local"
+
+
+def bws_environment() -> dict[str, str]:
+    values: dict[str, str] = {}
+    for env_file in ENV_FILES:
+        try:
+            mode = stat.S_IMODE(env_file.stat().st_mode)
+        except OSError:
+            continue
+        if mode & 0o077:
+            raise SyncError(f"{env_file} must have mode 600")
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key in ("BWS_ACCESS_TOKEN", "BWS_SERVER_URL") and value.strip():
+                values[key] = value.strip()
+    for key in ("BWS_ACCESS_TOKEN", "BWS_SERVER_URL"):
+        if os.environ.get(key):
+            values[key] = os.environ[key]
+    return values
+
+
+def auth_file_key(provider_id: str) -> str:
+    for name in SECRET_ALIASES.get(provider_id, ()):
+        if os.environ.get(name, "").strip():
+            return os.environ[name].strip()
+    auth = read_json(DATA_HOME / "opencode/auth.json", {})
+    provider_names = {"opencode-go": ("opencode-go",), "zai": ("zai-coding-plan", "zai", "zhipu"),
+                      "deepseek": ("deepseek",)}[provider_id]
+    for name in provider_names:
+        entry = auth.get(name) if isinstance(auth, dict) else None
+        if isinstance(entry, dict) and str(entry.get("key", "")).strip():
+            return str(entry["key"]).strip()
+    return ""
+
+
+def runtime_key(provider_id: str, secret_key: str) -> str:
+    path = RUNTIME_DIR / f"{provider_id}.json"
+    data = read_json(path, {})
+    return str(data.get("value", "")).strip() if data.get("secretKey") == secret_key else ""
+
+
+def secret_names(config: dict[str, Any], provider_id: str) -> tuple[str, ...]:
+    """Candidate Bitwarden secret keys for one provider, configured name first."""
+    names = [bounded_text(config["providers"][provider_id].get("secretKey"), 100)]
+    names += list(SECRET_ALIASES.get(provider_id, ()))
+    seen: list[str] = []
+    for name in names:
+        if name and name not in seen:
+            seen.append(name)
+    return tuple(seen)
+
+
+def cached_key(provider_id: str, names: tuple[str, ...]) -> tuple[str, str]:
+    """Return (secret_name, value) from the runtime cache, if any candidate hit."""
+    for name in names:
+        value = runtime_key(provider_id, name)
+        if value:
+            return name, value
+    return "", ""
+
+
+def cache_key(provider_id: str, secret_key: str, value: str) -> None:
+    RUNTIME_DIR.mkdir(mode=0o700, exist_ok=True)
+    info = RUNTIME_DIR.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+        raise SyncError("unsafe runtime credential cache")
+    os.chmod(RUNTIME_DIR, 0o700)
+    atomic_json(RUNTIME_DIR / f"{provider_id}.json", {"secretKey": secret_key, "value": value})
+
+
+def fetch_bws_keys(requests: dict[str, tuple[str, ...]]) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
+    """Resolve one secret per provider.
+
+    A provider whose secret is missing or unreadable only records its own
+    error: the remaining providers are still resolved, so one absent key never
+    blanks the whole dashboard.
+    """
+    env = dict(os.environ)
+    env.update(bws_environment())
+    if not env.get("BWS_ACCESS_TOKEN"):
+        raise SyncError("BWS_ACCESS_TOKEN is not configured; create ~/.config/omarchy/agent-limits.env (mode 600)")
+    binary = shutil.which("bws") or str(HOME / ".local/bin/bws")
+    try:
+        listed = subprocess.run([binary, "secret", "list"], env=env, capture_output=True, text=True, timeout=TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SyncError("Bitwarden Secrets CLI did not respond") from exc
+    if listed.returncode:
+        raise SyncError("Bitwarden Secrets CLI could not list secrets")
+    try:
+        payload = json.loads(listed.stdout)
+        entries = payload.get("data", payload) if isinstance(payload, dict) else payload
+        ids = {item.get("key"): item.get("id") for item in entries}
+    except (json.JSONDecodeError, TypeError, AttributeError) as exc:
+        raise SyncError("Bitwarden Secrets CLI returned an unexpected response") from exc
+    found: dict[str, tuple[str, str]] = {}
+    errors: dict[str, str] = {}
+    for provider_id, names in requests.items():
+        secret_key = next((name for name in names if ids.get(name)), "")
+        if not secret_key:
+            errors[provider_id] = f"secret {names[0]} was not found in Bitwarden"
+            continue
+        try:
+            response = subprocess.run([binary, "secret", "get", str(ids[secret_key])], env=env,
+                                      capture_output=True, text=True, timeout=TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired):
+            errors[provider_id] = f"could not retrieve {secret_key} from Bitwarden"
+            continue
+        if response.returncode:
+            errors[provider_id] = f"could not retrieve {secret_key} from Bitwarden"
+            continue
+        try:
+            value = str(json.loads(response.stdout).get("value", "")).strip()
+        except json.JSONDecodeError:
+            errors[provider_id] = f"Bitwarden returned an invalid response for {secret_key}"
+            continue
+        if not value:
+            errors[provider_id] = f"Bitwarden secret {secret_key} is empty"
+            continue
+        found[provider_id] = (secret_key, value)
+    return found, errors
+
+
+def credentials(config: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
+    keys, errors = {}, {}
+    missing: dict[str, tuple[str, ...]] = {}
+    for provider_id in SECRET_DEFAULTS:
+        if not config["providers"][provider_id].get("enabled", True):
+            continue
+        names = secret_names(config, provider_id)
+        value = auth_file_key(provider_id) or cached_key(provider_id, names)[1]
+        if value:
+            keys[provider_id] = value
+        else:
+            missing[provider_id] = names
+    if missing:
+        lock_path = RUNTIME_DIR / "credentials.lock"
+        RUNTIME_DIR.mkdir(mode=0o700, exist_ok=True)
+        try:
+            with lock_path.open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                # Another refresh may have filled the cache while we waited.
+                pending = {}
+                for provider_id, names in missing.items():
+                    value = cached_key(provider_id, names)[1]
+                    if value:
+                        keys[provider_id] = value
+                    else:
+                        pending[provider_id] = names
+                if pending:
+                    try:
+                        fetched, failures = fetch_bws_keys(pending)
+                    except SyncError as exc:
+                        for provider_id in pending:
+                            errors[provider_id] = str(exc)
+                    else:
+                        errors.update(failures)
+                        for provider_id, (name, value) in fetched.items():
+                            try:
+                                cache_key(provider_id, name, value)
+                            except (OSError, SyncError):
+                                # An unwritable runtime cache only costs an extra
+                                # Bitwarden lookup next refresh; the key in hand
+                                # is still perfectly usable.
+                                pass
+                            keys[provider_id] = value
+        except OSError:
+            for provider_id in missing:
+                errors[provider_id] = "could not lock runtime credential cache"
+    return keys, errors
+
+
+def request_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
+    parsed = urllib.parse.urlparse(url)
+    allowed = {"opencode.ai", "api.z.ai", "open.bigmodel.cn", "api.deepseek.com", "api.anthropic.com"}
+    if parsed.scheme != "https" or parsed.hostname not in allowed:
+        raise SyncError("refused an untrusted provider endpoint")
+    request = urllib.request.Request(url, headers={**headers, "Accept": "application/json", "User-Agent": USER_AGENT})
+    opener = urllib.request.build_opener(NoRedirect())
+    try:
+        with opener.open(request, timeout=TIMEOUT) as response:
+            raw = response.read(1_000_001)
+            if len(raw) > 1_000_000:
+                raise SyncError("provider response was too large")
+            return json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise SyncError("authentication failed or subscription is inactive") from exc
+        if exc.code == 429:
+            # Anthropic names the wait in Retry-After; honouring it is the
+            # difference between backing off and being locked out for longer.
+            raise SyncError("provider rate-limited the usage check",
+                            number((exc.headers or {}).get("Retry-After"), 0)) from exc
+        raise SyncError(f"provider returned HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise SyncError("provider usage endpoint is unavailable") from exc
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def reset_iso(milliseconds: Any) -> str:
+    value = number(milliseconds)
+    if value <= 0:
+        return ""
+    try:
+        return dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc).isoformat()
+    except (ValueError, OSError, OverflowError):
+        return ""
+
+
+def collect_opencode(key: str) -> tuple[list[dict[str, Any]], str]:
+    data = request_json("https://opencode.ai/zen/go/v1/usage", {"Authorization": f"Bearer {key}"})
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        raise SyncError("OpenCode returned an unexpected usage response")
+    limits = []
+    for key_name, label in (("rolling", "Session (5-hour)"), ("weekly", "Weekly (7-day)"), ("monthly", "Monthly")):
+        item = usage.get(key_name)
+        if not isinstance(item, dict):
+            continue
+        percent = max(0.0, min(100.0, number(item.get("percent"))))
+        exhausted = item.get("status") == "rate-limited" or percent >= 100
+        limits.append({"label": label, "percent": percent, "remaining": max(0, 100 - percent),
+                       "resetsAt": bounded_text(item.get("resetsAt"), 60), "exhausted": exhausted})
+    return limits, "Go"
+
+
+def collect_zai(key: str, region: str) -> tuple[list[dict[str, Any]], str]:
+    host = "open.bigmodel.cn" if region == "cn" else "api.z.ai"
+    data = request_json(f"https://{host}/api/monitor/usage/quota/limit",
+                        {"Authorization": key, "Accept-Language": "en-US,en", "Content-Type": "application/json"})
+    if data.get("success") is not True or not isinstance(data.get("data"), dict):
+        raise SyncError("Z.AI rejected the key or found no active Coding Plan")
+    payload = data["data"]
+    limits = []
+    for item in payload.get("limits", [])[:20]:
+        if not isinstance(item, dict):
+            continue
+        kind, unit, count = item.get("type"), integer(item.get("unit")), integer(item.get("number"))
+        if kind in ("CREDIT_LIMIT", "TOKENS_LIMIT") and (unit, count) == (3, 5):
+            label = "Session (5-hour)"
+        elif kind in ("CREDIT_LIMIT", "TOKENS_LIMIT") and (unit, count) == (6, 1):
+            label = "Weekly (7-day)"
+        elif kind == "TIME_LIMIT" and (unit, count) == (5, 1):
+            label = "MCP (monthly)"
+        else:
+            continue
+        percent = max(0.0, min(100.0, number(item.get("percentage"))))
+        limits.append({"label": label, "percent": percent, "remaining": max(0, 100 - percent),
+                       "used": number(item.get("currentValue")), "total": number(item.get("usage")),
+                       "unit": "credits" if kind == "CREDIT_LIMIT" else ("calls" if kind == "TIME_LIMIT" else "tokens"),
+                       "resetsAt": reset_iso(item.get("nextResetTime")), "exhausted": percent >= 100})
+    return limits, bounded_text(payload.get("level"), 40)
+
+
+def collect_deepseek(key: str) -> tuple[list[dict[str, Any]], bool]:
+    data = request_json("https://api.deepseek.com/user/balance", {"Authorization": f"Bearer {key}"})
+    if not isinstance(data.get("balance_infos"), list):
+        raise SyncError("DeepSeek returned an unexpected balance response")
+    balances = []
+    for item in data["balance_infos"][:5]:
+        currency = bounded_text(item.get("currency"), 3).upper()
+        if currency not in ("USD", "CNY"):
+            continue
+        balances.append({"currency": currency, "total": bounded_text(item.get("total_balance"), 30),
+                         "granted": bounded_text(item.get("granted_balance"), 30),
+                         "toppedUp": bounded_text(item.get("topped_up_balance"), 30)})
+    return balances, bool(data.get("is_available"))
+
+
+def preserve_on_error(fresh: dict[str, Any], previous: dict[str, Any], message: str) -> None:
+    # Keep local metrics from this run, but retain last-known remote limits.
+    for field in ("limits", "balance", "plan"):
+        if previous.get(field):
+            fresh[field] = previous[field]
+    fresh["stale"] = True
+    fresh["error"] = bounded_text(message)
+    fresh["syncedAt"] = integer(previous.get("syncedAt"))
+    fresh["status"] = "ready" if fresh["limits"] or fresh["balance"] or fresh["total"]["tokens"] else "error"
+
+
+def sync() -> dict[str, Any]:
+    config = load_config()
+    previous_cache = read_json(CACHE, empty_cache())
+    previous = {p.get("id"): p for p in previous_cache.get("providers", []) if isinstance(p, dict)}
+    ledger = opencode_ledger(config)
+    # OpenCode's database and pi's session logs are different traffic, so the
+    # two ledgers add up instead of replacing one another.
+    for provider_id, bucket in pi_ledger(config).items():
+        merge_ledger(ledger[provider_id], bucket)
+    keys, credential_errors = credentials(config)
+    output = []
+    remote_results: dict[str, Any] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {}
+        if "opencode-go" in keys:
+            futures[pool.submit(collect_opencode, keys["opencode-go"])] = "opencode-go"
+        if "zai" in keys:
+            futures[pool.submit(collect_zai, keys["zai"], config["providers"]["zai"].get("region", "global"))] = "zai"
+        if "deepseek" in keys:
+            futures[pool.submit(collect_deepseek, keys["deepseek"])] = "deepseek"
+        for future in concurrent.futures.as_completed(futures):
+            provider_id = futures[future]
+            try:
+                remote_results[provider_id] = future.result()
+            except SyncError as exc:
+                remote_results[provider_id] = exc
+            except Exception:
+                remote_results[provider_id] = SyncError("unexpected provider response")
+    for provider_id in PROVIDERS:
+        if not config["providers"][provider_id].get("enabled", True):
+            continue
+        if provider_id in ("claude", "codex"):
+            provider = native_provider(provider_id, config)
+        else:
+            provider = empty_provider(provider_id)
+            apply_ledger(provider, ledger[provider_id])
+            if provider_id == "zai":
+                provider["plan"] = bounded_text(config["providers"]["zai"].get("plan"), 40)
+            if provider_id == "opencode-go":
+                provider["plan"] = bounded_text(config["providers"]["opencode-go"].get("plan", "Go"), 40)
+            remote = remote_results.get(provider_id)
+            error = credential_errors.get(provider_id)
+            if provider_id not in keys and not error:
+                error = "credential not found; connect OpenCode or configure Bitwarden"
+            if isinstance(remote, SyncError):
+                error = str(remote)
+            elif remote is not None:
+                if provider_id == "deepseek":
+                    provider["balance"], available = remote
+                    provider["plan"] = "API" if available else "Balance exhausted"
+                else:
+                    provider["limits"], plan = remote
+                    provider["plan"] = plan or provider["plan"]
+                provider["syncedAt"] = int(time.time() * 1000)
+            if error:
+                preserve_on_error(provider, previous.get(provider_id, {}), error)
+            else:
+                provider["status"] = "ready"
+        output.append(provider)
+    cache = {"schemaVersion": 1, "state": "ready" if output else "setup",
+             "syncedAt": int(time.time() * 1000), "providers": output, "error": ""}
+    atomic_json(CACHE, cache)
+    return cache
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", nargs="?", default="sync", choices=("sync", "snapshot"))
+    args = parser.parse_args()
+    if args.command == "snapshot":
+        print(json.dumps(read_json(CACHE, empty_cache()), ensure_ascii=False))
+        return 0
+    lock_path = STATE_HOME / "omarchy/agent-limits/sync.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        try:
+            result = sync()
+        except Exception as exc:
+            # Never include URLs, response bodies, environment, or exception
+            # representations that could contain request headers.
+            previous = read_json(CACHE, empty_cache())
+            previous["state"] = "error"
+            previous["error"] = "synchronization failed; check configuration and connectivity"
+            atomic_json(CACHE, previous)
+            print(previous["error"], file=sys.stderr)
+            return 1
+    print(json.dumps({"state": result["state"], "providers": len(result["providers"])}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "id": "gshulga.agent-limits",
+  "name": "Agent Limits",
+  "version": "1.0.0",
+  "author": "gshulga",
+  "license": "MIT",
+  "description": "LLM subscription limits, token usage, and API-equivalent costs in one compact Omarchy dashboard.",
+  "kinds": ["bar-widget", "service"],
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "service": "Service.qml",
+    "dashboardPage": "EmbeddedPage.qml",
+    "sidePanelPage": "EmbeddedPage.qml"
+  },
+  "dashboard": {
+    "minWidth": 280,
+    "minHeight": 220,
+    "preferredWidth": 440,
+    "preferredHeight": 430,
+    "popout": {
+      "preferredWidth": 560,
+      "preferredHeight": 650,
+      "minWidth": 320,
+      "minHeight": 260
+    }
+  },
+  "barWidget": {
+    "displayName": "Agent Limits",
+    "description": "Limits first, then usage and API-equivalent costs for your LLM providers.",
+    "category": "AI",
+    "aliases": ["agents", "llm", "usage", "limits", "subscriptions"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 300,
+      "warningPercent": 80,
+      "criticalPercent": 95
+    },
+    "schema": [
+      { "key": "refreshIntervalSec", "type": "integer", "label": "Refresh interval (seconds)", "min": 60, "max": 3600, "step": 60, "defaultValue": 300 },
+      { "key": "warningPercent", "type": "integer", "label": "Warning threshold (%)", "min": 50, "max": 95, "step": 5, "defaultValue": 80 },
+      { "key": "criticalPercent", "type": "integer", "label": "Critical threshold (%)", "min": 60, "max": 100, "step": 5, "defaultValue": 95 }
+    ]
+  }
+}

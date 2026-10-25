@@ -1,0 +1,40 @@
+{
+  "providers": {
+    "opencode-go": { "enabled": true, "secretKey": "OPENCODE_GO_API_KEY", "plan": "Go" },
+    "zai": { "enabled": true, "secretKey": "ZAI_API_KEY", "region": "global" },
+    "claude": { "enabled": true },
+    "codex": { "enabled": true },
+    "deepseek": { "enabled": true, "secretKey": "DEEPSEEK_API_KEY" }
+  },
+
+  "_pricing": "USD per million tokens. Anthropic rows are the first-party list prices (base input, output, 5m cache write, cache hit). OpenAI rows are the Standard short-context prices; a '-fast' suffix is the Fast-mode price, which is twice the Standard rate. Models missing here are reported as unpriced instead of being guessed.",
+
+  "pricing": {
+    "claude-opus-5-5": { "input": 4, "output": 20, "cacheRead": 0.2, "cacheWrite": 5 },
+    "claude-sonnet-5-5": { "input": 2, "output": 10, "cacheRead": 0.1, "cacheWrite": 2.5 },
+    "claude-haiku-5-5": { "input": 0.1, "output": 0.5, "cacheRead": 0.01, "cacheWrite": 0.125 },
+    "claude-haiku-4-5-20251001": { "input": 1, "output": 5, "cacheRead": 0.1, "cacheWrite": 1.25 },
+
+    "gpt-6-astra": { "input": 10, "output": 50, "cacheRead": 1, "cacheWrite": 12.5 },
+    "gpt-6.1-sol": { "input": 2, "output": 10, "cacheRead": 0.1, "cacheWrite": 2.5 },
+    "gpt-6.1-sol-fast": { "input": 4, "output": 20, "cacheRead": 0.2, "cacheWrite": 5 },
+    "gpt-6-sol": { "input": 2, "output": 10, "cacheRead": 0.2, "cacheWrite": 2.5 },
+    "gpt-6-sol-fast": { "input": 4, "output": 20, "cacheRead": 0.4, "cacheWrite": 5 },
+    "gpt-6-luna": { "input": 0.1, "output": 0.5, "cacheRead": 0.01, "cacheWrite": 0.125 },
+    "gpt-6-luna-fast": { "input": 0.2, "output": 1, "cacheRead": 0.02, "cacheWrite": 0.25 },
+    "gpt-5.6-sol": { "input": 4, "output": 20, "cacheRead": 0.4, "cacheWrite": 5 },
+    "gpt-5.6-sol-fast": { "input": 8, "output": 40, "cacheRead": 0.8, "cacheWrite": 10 },
+    "gpt-5.6-terra": { "input": 2, "output": 12, "cacheRead": 0.2, "cacheWrite": 2.5 },
+    "gpt-5.6-terra-fast": { "input": 4, "output": 24, "cacheRead": 0.4, "cacheWrite": 5 },
+    "gpt-5.6-luna": { "input": 0.2, "output": 1.2, "cacheRead": 0.02, "cacheWrite": 0.25 },
+    "gpt-5.6-luna-fast": { "input": 0.4, "output": 2.4, "cacheRead": 0.04, "cacheWrite": 0.5 },
+
+    "glm-5.3": { "input": 1.4, "output": 4.4, "cacheRead": 0.26 },
+    "glm-5.3-flash": { "input": 0.15, "output": 0.5, "cacheRead": 0.03 },
+    "z-ai/glm-5.3-flash": { "input": 0.15, "output": 0.5, "cacheRead": 0.03 },
+    "deepseek-flash": { "input": 0.3, "output": 1.2, "cacheRead": 0.006 },
+    "deepseek-v4-flash": { "input": 0.3, "output": 1.2, "cacheRead": 0.006 },
+    "deepseek-v4.1-flash": { "input": 0.3, "output": 1.2, "cacheRead": 0.006 },
+    "deepseek-v4-pro": { "input": 1.32, "output": 3.96, "cacheRead": 0.044 }
+  }
+}
