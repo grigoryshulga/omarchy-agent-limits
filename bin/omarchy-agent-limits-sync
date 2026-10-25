@@ -43,6 +43,10 @@ PI_SESSIONS = HOME / ".pi/agent/sessions"
 # counting the same request twice.
 PI_PROVIDERS = {"deepseek": "deepseek", "zai": "zai", "zhipu": "zai", "z-ai": "zai",
                 "opencode-go": "opencode-go", "opencode": "opencode-go"}
+# Claude Code and Codex keep their own session logs with per-turn usage, which is
+# fresher than Omarchy's aggregated record and needs no hook to update.
+CLAUDE_PROJECTS = HOME / ".claude" / "projects"
+CODEX_SESSIONS = HOME / ".codex" / "sessions"
 ENV_FILES = tuple(CONFIG_HOME / "omarchy" / name for name in ("jira.env", "litellm.env", "agent-limits.env"))
 RUNTIME_DIR = Path(f"/run/user/{os.getuid()}/omarchy-agent-limits")
 TIMEOUT = 15
@@ -580,7 +584,8 @@ def native_limits(provider_id: str, now: float | None = None) -> tuple[list[dict
     return limits, plan, ""
 
 
-def native_provider(provider_id: str, config: dict[str, Any]) -> dict[str, Any]:
+def native_provider(provider_id: str, config: dict[str, Any],
+                    ledger: dict[str, Any] | None = None) -> dict[str, Any]:
     provider = empty_provider(provider_id)
     record = read_json(AGENT_RECORDS / f"{provider_id}.json", {})
     record = record if isinstance(record, dict) else {}
@@ -588,7 +593,7 @@ def native_provider(provider_id: str, config: dict[str, Any]) -> dict[str, Any]:
     # snapshot of the same numbers, and a snapshot the updater did not refresh
     # still describes a window that has already reset.
     live_limits, live_plan, limits_error = native_limits(provider_id)
-    if not record and not live_limits:
+    if not record and not live_limits and not ledger:
         provider["status"] = "unavailable"
         provider["error"] = limits_error or "Omarchy agent record is not available yet"
         return provider
@@ -609,6 +614,12 @@ def native_provider(provider_id: str, config: dict[str, Any]) -> dict[str, Any]:
         provider["stale"] = bool(record.get("limitsStale")) or bool(provider["limits"])
         if not provider["limits"]:
             provider["error"] = limits_error or bounded_text(record.get("usageStatusText"))
+    if ledger and (integer(ledger["total"].get("tokens")) > 0 or integer(ledger["total"].get("requests")) > 0):
+        # The CLI's own session logs are the freshest local record of what was
+        # spent, so they win over the aggregated snapshot.
+        apply_ledger(provider, ledger)
+        provider["status"] = "ready"
+        return provider
     days: dict[str, dict[str, Any]] = {}
     for item in record.get("recentDays", []) if isinstance(record.get("recentDays"), list) else []:
         day = bounded_text(item.get("date"), 10)
@@ -741,6 +752,135 @@ def pi_timestamp_day(value: Any) -> str:
     return parsed.date().isoformat() if parsed else ""
 
 
+def empty_harness_ledger() -> dict[str, Any]:
+    return {"days": {}, "models": {}, "total": empty_metrics(), "hours": {}}
+
+
+def add_turn(bucket: dict[str, Any], model: str, metrics: dict[str, Any], moment: dt.datetime,
+             pricing: dict[str, Any], recorded: float = -1.0) -> None:
+    """Attribute one billable turn to its model, day and hour."""
+    normalised = {"inputTokens": metrics["input"], "outputTokens": metrics["output"],
+                  "cacheReadInputTokens": metrics["cacheRead"],
+                  "cacheCreationInputTokens": metrics["cacheWrite"]}
+    cost = recorded if recorded > 0 else price_model(model, normalised, pricing)
+    price_metrics(metrics, cost)
+    day = moment.date().isoformat()
+    merge_metrics(bucket["days"].setdefault(day, empty_metrics()), metrics)
+    merge_metrics(bucket["models"].setdefault(model, empty_metrics()), metrics)
+    merge_metrics(bucket["total"], metrics)
+    if day == dt.date.today().isoformat():
+        merge_metrics(bucket["hours"].setdefault(moment.hour, empty_metrics()), metrics)
+
+
+def claude_ledger(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Claude Code's own session logs, priced locally.
+
+    Omarchy's claude record is only as fresh as its updater; the CLI appends a
+    turn to these logs as it happens, so usage keeps moving without a hook.
+    """
+    bucket = empty_harness_ledger()
+    pricing = config.get("pricing", {})
+    sessions: set[str] = set()
+    if not CLAUDE_PROJECTS.is_dir():
+        return {"claude": bucket}
+    try:
+        paths = sorted(CLAUDE_PROJECTS.rglob("*.jsonl"))
+    except OSError:
+        return {"claude": bucket}
+    for path in paths:
+        try:
+            handle = path.open(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                if '"assistant"' not in line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                message = item.get("message") if isinstance(item, dict) else None
+                if not isinstance(message, dict) or message.get("role") != "assistant":
+                    continue
+                model = bounded_text(message.get("model"), 120)
+                # Claude Code writes "<synthetic>" for its own error placeholders.
+                if not model or model.startswith("<"):
+                    continue
+                usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+                metrics = metrics_from_usage({"inputTokens": usage.get("input_tokens"),
+                                              "outputTokens": usage.get("output_tokens"),
+                                              "cacheReadInputTokens": usage.get("cache_read_input_tokens"),
+                                              "cacheCreationInputTokens": usage.get("cache_creation_input_tokens")},
+                                             requests=1)
+                if integer(metrics["tokens"]) <= 0:
+                    continue
+                moment = pi_local_timestamp(item.get("timestamp"))
+                if not moment:
+                    continue
+                add_turn(bucket, model, metrics, moment, pricing)
+                sessions.add(bounded_text(item.get("sessionId"), 80) or path.stem)
+    bucket["total"]["sessions"] = len(sessions)
+    return {"claude": bucket}
+
+
+def codex_ledger(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Codex rollout logs: one token_usage_record per API response."""
+    bucket = empty_harness_ledger()
+    pricing = config.get("pricing", {})
+    sessions: set[str] = set()
+    if not CODEX_SESSIONS.is_dir():
+        return {"codex": bucket}
+    try:
+        paths = sorted(CODEX_SESSIONS.rglob("rollout-*.jsonl"))
+    except OSError:
+        return {"codex": bucket}
+    for path in paths:
+        try:
+            handle = path.open(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        model = ""
+        with handle:
+            for line in handle:
+                # Full JSON parsing of 260 MB of rollout history costs more than
+                # the check itself; only two record kinds matter here.
+                if '"token_usage_record"' not in line and '"turn_context"' not in line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                kind = item.get("type") if isinstance(item, dict) else None
+                payload = item.get("payload") if isinstance(item, dict) else None
+                if not isinstance(payload, dict):
+                    continue
+                if kind == "turn_context":
+                    model = bounded_text(payload.get("model"), 120) or model
+                    continue
+                if kind != "token_usage_record":
+                    continue
+                usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+                # Codex counts cached input inside input_tokens; the pricing
+                # table prices it separately, so subtract it here.
+                cached = integer(usage.get("cached_input_tokens"))
+                billable_input = max(0, integer(usage.get("input_tokens")) - cached)
+                metrics = metrics_from_usage({"inputTokens": billable_input,
+                                              "outputTokens": usage.get("output_tokens"),
+                                              "cacheReadInputTokens": cached,
+                                              "cacheWriteInputTokens": usage.get("cache_write_input_tokens")},
+                                             requests=1)
+                if integer(metrics["tokens"]) <= 0:
+                    continue
+                moment = pi_local_timestamp(item.get("timestamp"))
+                if not moment:
+                    continue
+                add_turn(bucket, model or "codex-unknown", metrics, moment, pricing)
+                sessions.add(path.stem)
+    bucket["total"]["sessions"] = len(sessions)
+    return {"codex": bucket}
+
+
 def pi_usage_cost(usage: dict[str, Any]) -> float:
     """Recorded harness cost, or -1 when the harness did not price the turn."""
     cost = usage.get("cost")
@@ -796,24 +936,10 @@ def pi_ledger(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 if tokens > 0:
                     metrics["tokens"] = tokens
                 model = bounded_text(message.get("model") or "unknown", 120)
-                # price_model reads the *Tokens* key style; the metrics already
-                # hold the normalised counts, so price from those instead of
-                # re-deriving them from the harness payload.
-                normalised = {"inputTokens": metrics["input"], "outputTokens": metrics["output"],
-                              "cacheReadInputTokens": metrics["cacheRead"],
-                              "cacheCreationInputTokens": metrics["cacheWrite"]}
-                cost = recorded if recorded > 0 else price_model(model, normalised, pricing)
-                price_metrics(metrics, cost)
                 moment = pi_local_timestamp(item.get("timestamp"))
                 if not moment:
                     continue
-                day = moment.date().isoformat()
-                bucket = result[provider_id]
-                merge_metrics(bucket["days"].setdefault(day, empty_metrics()), metrics)
-                merge_metrics(bucket["models"].setdefault(model, empty_metrics()), metrics)
-                merge_metrics(bucket["total"], metrics)
-                if day == dt.date.today().isoformat():
-                    merge_metrics(bucket["hours"].setdefault(moment.hour, empty_metrics()), metrics)
+                add_turn(result[provider_id], model, metrics, moment, pricing, recorded)
                 sessions[provider_id].add(path.name)
     for provider_id, bucket in result.items():
         bucket["total"]["sessions"] = len(sessions[provider_id])
@@ -1133,6 +1259,7 @@ def sync() -> dict[str, Any]:
     # two ledgers add up instead of replacing one another.
     for provider_id, bucket in pi_ledger(config).items():
         merge_ledger(ledger[provider_id], bucket)
+    native_ledgers = {**claude_ledger(config), **codex_ledger(config)}
     keys, credential_errors = credentials(config)
     output = []
     remote_results: dict[str, Any] = {}
@@ -1156,7 +1283,7 @@ def sync() -> dict[str, Any]:
         if not config["providers"][provider_id].get("enabled", True):
             continue
         if provider_id in ("claude", "codex"):
-            provider = native_provider(provider_id, config)
+            provider = native_provider(provider_id, config, native_ledgers.get(provider_id))
         else:
             provider = empty_provider(provider_id)
             apply_ledger(provider, ledger[provider_id])

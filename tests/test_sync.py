@@ -485,3 +485,110 @@ class RateLimitBackoffTests(unittest.TestCase):
     def test_the_wait_expires(self):
         MODULE.remember_live_limits("claude", {"failedAt": 1000.0, "error": "rate limited", "retryAfter": 120})
         self.assertEqual(MODULE.cached_live_limits("claude", now=1000.0 + MODULE.LIVE_LIMITS_BACKOFF + 1), ([], "", "", False))
+
+class HarnessLedgerTests(unittest.TestCase):
+    """Claude Code and Codex log their own turns, which keeps usage moving
+    without waiting for Omarchy's updater to run."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.pricing = {"pricing": {
+            "claude-sonnet-5-5": {"input": 2, "output": 10, "cacheRead": 0.1, "cacheWrite": 2.5},
+            "gpt-6-astra": {"input": 10, "output": 50, "cacheRead": 1, "cacheWrite": 12.5},
+        }}
+        self.now = MODULE.dt.datetime.now().astimezone()
+
+    def _stamp(self, moment=None):
+        moment = moment or self.now
+        return moment.astimezone(MODULE.dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _claude_line(self, role="assistant", model="claude-sonnet-5-5", usage=None, stamp=None):
+        return json.dumps({"type": role, "sessionId": "session-one", "timestamp": stamp or self._stamp(),
+                           "message": {"role": role, "model": model,
+                                       "usage": usage if usage is not None else {
+                                           "input_tokens": 100, "output_tokens": 50,
+                                           "cache_read_input_tokens": 1000,
+                                           "cache_creation_input_tokens": 400}}})
+
+    def _claude(self, lines):
+        path = self.root / "claude" / "projects" / "project-one" / "session-one.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n")
+        with patch.object(MODULE, "CLAUDE_PROJECTS", self.root / "claude" / "projects"):
+            return MODULE.claude_ledger(self.pricing)["claude"]
+
+    def test_claude_turn_is_counted_and_priced(self):
+        bucket = self._claude([self._claude_line()])
+        total = bucket["total"]
+        self.assertEqual(total["tokens"], 1550)
+        self.assertEqual((total["input"], total["output"], total["cacheRead"], total["cacheWrite"]), (100, 50, 1000, 400))
+        self.assertEqual((total["requests"], total["sessions"]), (1, 1))
+        self.assertTrue(total["priced"])
+        self.assertAlmostEqual(total["cost"], (100 * 2 + 50 * 10 + 1000 * 0.1 + 400 * 2.5) / 1_000_000)
+        self.assertIn(self.now.date().isoformat(), bucket["days"])
+        self.assertIn(self.now.hour, bucket["hours"])
+
+    def test_claude_placeholders_and_prompts_are_not_requests(self):
+        bucket = self._claude([
+            self._claude_line(model="<synthetic>", usage={"input_tokens": 0, "output_tokens": 0}),
+            self._claude_line(role="user", usage={"input_tokens": 900, "output_tokens": 0}),
+            self._claude_line(usage={"input_tokens": 0, "output_tokens": 0}),
+        ])
+        self.assertEqual(bucket["total"]["requests"], 0)
+        self.assertEqual(bucket["total"]["tokens"], 0)
+
+    def test_claude_unknown_model_stays_unpriced(self):
+        bucket = self._claude([self._claude_line(model="claude-unlisted-9")])
+        self.assertEqual(bucket["total"]["tokens"], 1550)
+        self.assertFalse(bucket["total"]["priced"])
+
+    def _codex(self, lines, name="rollout-one.jsonl"):
+        path = self.root / "codex" / "2026" / "10" / "25" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n")
+        with patch.object(MODULE, "CODEX_SESSIONS", self.root / "codex"):
+            return MODULE.codex_ledger(self.pricing)["codex"]
+
+    def _codex_usage(self, input_tokens=1000, cached=800, output=100, write=0, stamp=None):
+        return json.dumps({"type": "token_usage_record", "timestamp": stamp or self._stamp(),
+                           "payload": {"usage": {"input_tokens": input_tokens, "cached_input_tokens": cached,
+                                                 "cache_write_input_tokens": write, "output_tokens": output}}})
+
+    def _codex_model(self, model="gpt-6-astra", stamp=None):
+        return json.dumps({"type": "turn_context", "timestamp": stamp or self._stamp(),
+                           "payload": {"model": model}})
+
+    def test_codex_cached_input_is_not_billed_twice(self):
+        bucket = self._codex([self._codex_model(), self._codex_usage()])
+        total = bucket["total"]
+        self.assertEqual((total["input"], total["cacheRead"], total["output"]), (200, 800, 100))
+        self.assertEqual(total["tokens"], 1100)
+        self.assertEqual(total["requests"], 1)
+        self.assertAlmostEqual(total["cost"], (200 * 10 + 100 * 50 + 800 * 1) / 1_000_000)
+        self.assertIn("gpt-6-astra", bucket["models"])
+
+    def test_codex_model_comes_from_the_turn_context(self):
+        bucket = self._codex([self._codex_model("gpt-6.1-sol"), self._codex_usage()])
+        self.assertIn("gpt-6.1-sol", bucket["models"])
+        self.assertFalse(bucket["total"]["priced"])
+
+    def test_a_codex_session_without_a_turn_context_still_counts(self):
+        bucket = self._codex([self._codex_usage()])
+        self.assertEqual(bucket["total"]["tokens"], 1100)
+        self.assertIn("codex-unknown", bucket["models"])
+
+    def test_native_provider_prefers_the_ledger_over_the_record(self):
+        records = self.root / "agents"
+        records.mkdir()
+        (records / "claude.json").write_text(json.dumps({
+            "tierLabel": "Pro", "recentDays": [{"date": self.now.date().isoformat(), "messageCount": 0}],
+            "todayTotalTokens": 0, "modelUsage": {}, "totalPrompts": 1, "totalSessions": 1}))
+        bucket = self._claude([self._claude_line()])
+        with patch.object(MODULE, "AGENT_RECORDS", records):
+            with patch.object(MODULE, "native_limits", return_value=([], "", "rate limited")):
+                provider = MODULE.native_provider("claude", self.pricing, bucket)
+        self.assertEqual(provider["total"]["tokens"], 1550)
+        self.assertEqual(provider["today"]["tokens"], 1550)
+        self.assertEqual(provider["status"], "ready")

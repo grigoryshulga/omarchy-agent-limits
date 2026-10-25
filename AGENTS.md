@@ -176,6 +176,17 @@ after backing the file up. Diff the config structurally before and after any
 - Every limit that describes a finished window is rolled forward by
   `roll_expired_limits()` in whole periods, so the card never shows a stale
   percentage next to an elapsed reset time.
+- Usage is read from the logs the tools keep (`claude_ledger()`, `codex_ledger()`,
+  `pi_ledger()`, `opencode_ledger()`), not from Omarchy's aggregated record: the
+  record is only a fallback for limits and for a missing log. One turn is one
+  request; the API providers count a turn's `requests` the same way.
+- Two log formats need care. Claude Code writes `model: "<synthetic>"` for its
+  own error placeholders (skip anything starting with `<`) and keeps prompt.
+  Codex counts cached input *inside* `input_tokens`, so `codex_ledger()`
+  subtracts it before pricing and books it at the `cacheRead` rate instead.
+- 388 MB of session logs are parsed on every sync, so each walker filters lines
+  by substring (`'"token_usage_record"' not in line`) before `json.loads`. That
+  prefilter is what keeps a sync at ~1.5 s; keep it when adding a log format.
 
 ## Commits
 

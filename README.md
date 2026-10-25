@@ -23,11 +23,15 @@ that a hook had not refreshed yet:
 * **OpenCode Go, Z.AI** — their live quota endpoints.
 * **DeepSeek** — its documented balance endpoint.
 
-Omarchy's `~/.local/state/omarchy/agents/usage/*.json` records are still read for
-local token statistics, and their limits remain a **fallback** for when a probe
-fails; the cache marks which one was used in `limitsSource` (`live` or
-`record`). A card showing a fallback labels its plan `Pro · cached`, so an
-unrefreshed number never looks freshly measured.
+Token statistics come from the logs the tools themselves keep, so they move
+without any hook of ours: `~/.claude/projects/**/*.jsonl` for Claude Code,
+`~/.codex/sessions/**/rollout-*.jsonl` for Codex, `~/.pi/agent/sessions` and the
+OpenCode database for the API providers. Omarchy's
+`~/.local/state/omarchy/agents/usage/*.json` records are still read, but only as
+a **fallback**: their limits when a probe fails, and their usage when a CLI log
+is missing. The cache marks which limit source was used in `limitsSource`
+(`live` or `record`), and a card showing a fallback labels its plan
+`Pro · cached`, so an unrefreshed number never looks freshly measured.
 
 Probes are not free, so each answer is kept for a few minutes (5 for Claude, 4
 for Codex) and a failure is remembered for 10 minutes, extended by any
@@ -72,8 +76,10 @@ One run of `sync`:
 3. Remote checks run concurrently (OpenCode Go, Z.AI, DeepSeek in a three-thread
    pool; Claude and Codex through the probe cache described above).
 4. Local ledgers are read and **added**: `opencode_ledger()` reads the OpenCode
-   database, `pi_ledger()` reads pi's session logs; `merge_ledger()` sums them
-   per provider, day, hour and model.
+   database, `pi_ledger()` reads pi's session logs, `claude_ledger()` and
+   `codex_ledger()` read the CLIs' own session logs; `merge_ledger()` sums them
+   per provider, day, hour and model. A CLI log with data replaces Omarchy's
+   aggregated record for that provider rather than adding to it.
 5. `price_model()`/`price_metrics()` price each model against `pricing`;
    recorded costs win where the harness stored one.
 6. `finalize_provider()` derives `today`/`week`/`total` from the day buckets,
@@ -213,15 +219,16 @@ never blanks the providers that did resolve.
 }
 ```
 
-Recorded positive OpenCode costs win over estimates. For native Claude/Codex
-records, costs are calculated from token totals and this table; because those
-records only publish daily *token* totals, the daily/weekly cost is the all-time
-model cost spread over all-time tokens and applied per day — the shape of the
-trend is exact, the per-token rate is an average. Update prices when providers
-change them. Fixed subscription fees are intentionally not mixed into the
-API-equivalent total. The exact prices currently configured are documented in
-`config.example.json` (OpenAI Standard short-context, and Fast mode = 2 ×
-Standard).
+Recorded positive OpenCode costs win over estimates. Every other turn is priced
+turn by turn against this table, so Claude and Codex costs follow their own logs
+rather than a daily average. The one averaged case left is a provider whose only
+source is Omarchy's aggregated record (no CLI log found): that record publishes
+daily token totals only, so the cost is the all-time model cost spread over
+all-time tokens and applied per day — the shape of the trend is exact, the
+per-token rate is an average. Update prices when providers change them. Fixed
+subscription fees are intentionally not mixed into the API-equivalent total. The
+exact prices currently configured are documented in `config.example.json`
+(OpenAI Standard short-context, and Fast mode = 2 × Standard).
 
 ## Provider marks
 
@@ -255,12 +262,11 @@ underline uses the provider's own chart colour. The palette is derived from the
 theme accent (lightened toward the foreground, deepened for the alternate
 steps), so it follows the theme instead of hardcoding brand colours.
 
-`Today` switches the plot to 24 hourly buckets with tick labels. Only harnesses
-that record per-turn timestamps (pi sessions, the OpenCode database) can be
-split by hour; providers whose usage comes from Omarchy's daily agent records
-(Claude, ChatGPT) cannot, so the chart says `no hourly detail: <provider>`
-rather than silently flattening their share to zero. Their *limits* are read
-live, but their token counts are still daily figures.
+`Today` switches the plot to 24 hourly buckets with tick labels. Every log that
+records per-turn timestamps (pi sessions, the OpenCode database, Claude Code and
+Codex rollouts) can be split by hour. Only a provider falling back to Omarchy's
+aggregated daily record cannot, so the chart names it with
+`no hourly detail: <provider>` instead of silently flattening its share to zero.
 
 ## Reset rollover
 
