@@ -49,6 +49,83 @@ When a provider shows quota pressure but no readable log (OpenCode Go today),
 its breakdown row prints `—` with `no local usage log` instead of a false
 `0 requests / $0.00`.
 
+## How it works
+
+The plugin is two halves and one file between them. Nothing else couples them:
+the QML never calls a provider, and the collector never renders.
+
+```text
+bin/omarchy-agent-limits-sync  ──▶  ~/.local/state/omarchy/agent-limits/data.json  ──▶  QML views
+  collect · price · roll             aggregates only, mode 0600                 bar · panel · pages
+```
+
+### The collector
+
+One run of `sync`:
+
+1. `load_config()` merges `~/.config/omarchy/agent-limits.json` over
+   `config.example.json`, so a missing or partial config still yields a complete
+   one.
+2. `credentials()` resolves each provider independently — process environment,
+   then OpenCode's `auth.json`, then the private runtime cache, then Bitwarden.
+   A provider that cannot be resolved takes its own error with it.
+3. Remote checks run concurrently (OpenCode Go, Z.AI, DeepSeek in a three-thread
+   pool; Claude and Codex through the probe cache described above).
+4. Local ledgers are read and **added**: `opencode_ledger()` reads the OpenCode
+   database, `pi_ledger()` reads pi's session logs; `merge_ledger()` sums them
+   per provider, day, hour and model.
+5. `price_model()`/`price_metrics()` price each model against `pricing`;
+   recorded costs win where the harness stored one.
+6. `finalize_provider()` derives `today`/`week`/`total` from the day buckets,
+   builds the `days`, `hours` and `models` series, and ends by rolling any limit
+   whose window already reset.
+7. `atomic_json()` writes the cache through a temporary file, so a reader never
+   sees half a file.
+
+A run is single-instance: it takes a non-blocking `flock` on
+`$XDG_STATE_HOME/omarchy/agent-limits/sync.lock` and a second invocation exits
+quietly, which makes it safe to call from several surfaces at once.
+`snapshot` prints the cache and touches no network.
+
+### The cache
+
+`data.json` is the only contract between the halves. Per provider:
+
+| Field | Contents |
+|---|---|
+| `limits[]` | `label`, `percent` (0–100, never a fraction), `remaining`, `exhausted`, `resetsAt` (ISO UTC, empty when unknown) |
+| `limitsSource` | `live` (probed now) or `record` (Omarchy's snapshot, shown as `cached`) |
+| `balance[]` | DeepSeek's real `{currency, total, granted, toppedUp}` strings |
+| `today` / `week` / `total` | `tokens`, `input`, `output`, `cacheRead`, `cacheWrite`, `cost`, `priced`, `requests`, `sessions` |
+| `days[]` / `hours[]` | 30 daily and 24 hourly buckets with the same metric keys |
+| `models[]` | Top 20 model rows, already priced and sorted |
+| `status` / `error` / `stale` / `syncedAt` | Honest per-provider state; one provider never blanks another |
+
+No prompt text, session content, credential, or raw API response is ever stored
+— only aggregates, plan names and rate-limit state.
+
+### The views
+
+- `Service.qml` is the always-on half: it watches the cache with `FileView` and
+  runs the collector on a timer. `Panel.qml` reads it through
+  `bar.shell.serviceFor()`.
+- `EmbeddedPage.qml` serves **both** hosts. It declares `initializeDashboard`,
+  `dashboardActivate`, `dashboardDeactivate`, `dashboardFocus` and the
+  `sidePanel…` equivalents, so no host has to adapt it.
+- `Dashboard.qml` and `DailyChart.qml` are pure presentation over `cache`.
+- `Model.js` holds the helpers they share — formatting, window sums, stacking,
+  parse/cap of the cache. It imports no QML type, which is why it can be unit
+  tested by `node`.
+- `Panel.qml` owns the widget text (remaining percentage of the tightest
+  window), the popup shell and the plugin's IPC handler.
+
+### Failure model
+
+Every provider is settled on its own: a failed remote check keeps the previous
+limits via `preserve_on_error()`, sets `error` and `stale`, and never throws
+into QML. A run that dies entirely leaves the previous cache in place and only
+flips `state` to `error` with a fixed, credential-free message.
+
 ## Install
 
 For local development:
