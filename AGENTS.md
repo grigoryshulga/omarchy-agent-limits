@@ -76,6 +76,11 @@ Generate the cache with `bin/omarchy-agent-limits-sync snapshot`, then run
 `convert /tmp/shot.png -crop 430x660+0+0 +repage -resize 200% out.png` (use
 `magick` if `convert` complains).
 
+A running probe is a real window on the desktop: kill it when the shot is
+taken, by pid (`ps -C quickshell -o pid=,args=`, then `kill <pid>`). Never
+`pkill -f "quickshell -n -p /tmp/probe"` — the pattern also matches the
+invoking shell and kills your own command.
+
 Gotchas: a leftover probe holds quickshell's single-instance slot and the new
 run exits after "Configuration Loaded" while `grim` captures the old window —
 kill the old pid first. `cp -r i18n /tmp/probe/i18n` into an existing directory
