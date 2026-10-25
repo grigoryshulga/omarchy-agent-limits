@@ -110,6 +110,18 @@ function resetLabel(value, now, strings) {
   return strings ? format(strings.t("time.minutes"), [remaining]) : remaining + "m"
 }
 
+function elapsedLabel(momentMs, now, strings) {
+  var moment = number(momentMs)
+  if (moment <= 0) return ""
+  var minutes = Math.floor((number(now, Date.now()) - moment) / 60000)
+  if (minutes < 1) return strings ? strings.t("time.now") : "now"
+  var hours = Math.floor(minutes / 60)
+  var days = Math.floor(hours / 24)
+  if (days > 0) return strings ? format(strings.t("time.daysHours"), [days, hours % 24]) : days + "d " + (hours % 24) + "h"
+  if (hours > 0) return strings ? format(strings.t("time.hoursMinutes"), [hours, minutes % 60]) : hours + "h " + (minutes % 60) + "m"
+  return strings ? format(strings.t("time.minutes"), [minutes]) : minutes + "m"
+}
+
 function updatedLabel(cache, now, refreshing, strings) {
   if (refreshing) return strings.t("status.refreshing")
   if (!cache || !cache.syncedAt) return "—"
@@ -257,7 +269,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     emptyCache, parseCache, number, sum, sessions, requests, tokens, cost,
     formatTokens, formatMoney, count, format, highestPressure, tightestWindow, remainingPercent, resetLabel,
-    updatedLabel, daily, dayLabel, escapeMarkup, windowSize, windowSeries, windowTotal, providerWindow,
+    updatedLabel, elapsedLabel, daily, dayLabel, escapeMarkup, windowSize, windowSeries, windowTotal, providerWindow,
     hourly, hourlyTotal, providersWithoutHours, stackedDaily, stackedHourly
   }
 }

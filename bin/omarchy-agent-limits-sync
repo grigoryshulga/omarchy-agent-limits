@@ -130,7 +130,7 @@ def empty_metrics() -> dict[str, Any]:
 
 def empty_provider(provider_id: str) -> dict[str, Any]:
     return {"id": provider_id, "name": NAMES[provider_id], "plan": "", "limits": [],
-            "limitsSource": "", "balance": [], "today": empty_metrics(), "week": empty_metrics(),
+            "limitsSource": "", "limitsCheckedAt": 0, "balance": [], "today": empty_metrics(), "week": empty_metrics(),
             "total": empty_metrics(), "days": [], "models": [], "status": "loading",
             "error": "", "stale": False, "syncedAt": 0, "scope": "local"}
 
@@ -314,6 +314,10 @@ def finalize_provider(provider: dict[str, Any], days: dict[str, dict[str, Any]],
     provider["models"] = model_rows(models)
     provider["hours"] = hours_series(hours)
     roll_expired_limits(provider)
+    if not provider.get("limitsCheckedAt") and provider.get("limits") and provider.get("limitsSource") != "record":
+        # A provider whose limits were asked for in this run is measured now; a
+        # record-backed card keeps 0 so it cannot claim to be freshly checked.
+        provider["limitsCheckedAt"] = int(time.time() * 1000)
 
 
 def record_limits(record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -593,6 +597,11 @@ def native_provider(provider_id: str, config: dict[str, Any],
     # snapshot of the same numbers, and a snapshot the updater did not refresh
     # still describes a window that has already reset.
     live_limits, live_plan, limits_error = native_limits(provider_id)
+    probe_state = live_limits_state().get(provider_id)
+    if live_limits and isinstance(probe_state, dict):
+        # When the number was read, not when it was written: a card that shows
+        # "checked 2 min ago" makes a frozen-looking limit explainable.
+        provider["limitsCheckedAt"] = int(number(probe_state.get("fetchedAt")) * 1000)
     if not record and not live_limits and not ledger:
         provider["status"] = "unavailable"
         provider["error"] = limits_error or "Omarchy agent record is not available yet"
@@ -1305,6 +1314,9 @@ def sync() -> dict[str, Any]:
                     provider["limits"], plan = remote
                     provider["plan"] = plan or provider["plan"]
                 provider["syncedAt"] = int(time.time() * 1000)
+                # These limits were asked for in this run, so they are fresh.
+                if provider["limits"]:
+                    provider["limitsCheckedAt"] = provider["syncedAt"]
             if error:
                 preserve_on_error(provider, previous.get(provider_id, {}), error)
             else:

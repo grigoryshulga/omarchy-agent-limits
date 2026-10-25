@@ -111,6 +111,20 @@ Column {
     return reset ? label + " · ↻ " + reset : label
   }
 
+  // A limit that looks frozen is usually a limit that was measured a while ago,
+  // so the refresh control says when each number was last read.
+  readonly property string limitsTooltip: {
+    var lines = [strings.t("action.refresh")]
+    var list = root.cache.providers || []
+    for (var i = 0; i < list.length; i++) {
+      var provider = list[i]
+      var checked = Model.number(provider.limitsCheckedAt)
+      if (checked <= 0 || !(provider.limits || []).length) continue
+      lines.push(String(provider.name || provider.id) + " · " + Model.elapsedLabel(checked, root.nowMs, strings))
+    }
+    return lines.join("\n")
+  }
+
   Item {
     width: parent.width
     implicitHeight: Math.max(titleText.implicitHeight, refreshButton.implicitHeight)
@@ -137,7 +151,7 @@ Column {
       anchors.top: parent.top
       anchors.right: parent.right
       iconText: "󰑐"
-      tooltipText: strings.t("action.refresh")
+      tooltipText: Model.escapeMarkup(root.limitsTooltip)
       foreground: root.foreground
       hoverColor: root.accent
       fontFamily: root.fontFamily

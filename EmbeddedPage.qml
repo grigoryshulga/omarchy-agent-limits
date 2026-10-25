@@ -40,6 +40,7 @@ Item {
   function refresh() { if (!syncProcess.running) syncProcess.running = true }
 
   FileView {
+    id: cacheView
     path: root.statePath
     watchChanges: true
     printErrors: false
@@ -47,7 +48,14 @@ Item {
     onLoaded: root.cache = Model.parseCache(text())
     onLoadFailed: root.cache = Model.emptyCache()
   }
-  Process { id: syncProcess; command: [root.pluginDir + "bin/omarchy-agent-limits-sync", "sync"] }
+  Process {
+    id: syncProcess
+    command: [root.pluginDir + "bin/omarchy-agent-limits-sync", "sync"]
+    // The cache is written through a temporary file and renamed into place, so
+    // an inotify watch follows the old inode and stops reporting changes.
+    // Reading the file again as soon as the writer exits keeps the view current.
+    onExited: cacheView.reload()
+  }
   Timer {
     interval: Math.max(60, Math.min(3600, Number(root.settings.refreshIntervalSec || 300))) * 1000
     running: root.active

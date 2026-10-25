@@ -17,6 +17,7 @@ Item {
   function refresh() { if (!syncProcess.running) syncProcess.running = true }
 
   FileView {
+    id: cacheView
     path: root.statePath
     watchChanges: true
     printErrors: false
@@ -27,6 +28,10 @@ Item {
   Process {
     id: syncProcess
     command: [root.pluginDir + "bin/omarchy-agent-limits-sync", "sync"]
+    // The cache is written through a temporary file and renamed into place, so
+    // an inotify watch follows the old inode and stops reporting changes.
+    // Reading the file again as soon as the writer exits keeps the view current.
+    onExited: cacheView.reload()
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.lastError = String(text || "").trim().slice(0, 300)

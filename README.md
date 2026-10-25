@@ -282,6 +282,12 @@ with no known period clears the reset time instead of inventing one.
 ## Interactions
 
 - **Left click:** open the panel; **middle click:** refresh.
+- **Refresh** reruns the whole collector — local logs are re-read and re-priced
+  every time. Remote limits are served from the probe cache (5 min Claude, 4
+  min Codex, 10 min after a failure), so two clicks within a minute honestly
+  return the same number. Hovering the refresh icon lists when each
+  provider's limit was last measured, which separates a slow-moving quota
+  from a number that is not being read.
 - **R / Enter:** refresh; **1 / 2 / 3:** Limits / Usage / Cost.
 - **Left / Right:** switch tabs; **Up / Down:** scroll; **Esc:** close.
 - The bar percentage is the amount left in the most pressured quota window; its

@@ -592,3 +592,24 @@ class HarnessLedgerTests(unittest.TestCase):
         self.assertEqual(provider["total"]["tokens"], 1550)
         self.assertEqual(provider["today"]["tokens"], 1550)
         self.assertEqual(provider["status"], "ready")
+
+    def test_live_limits_carry_the_time_they_were_measured(self):
+        records = self.root / "agents"
+        records.mkdir()
+        row = MODULE.limit_row("Weekly (7-day)", 15.0, 1793514407)
+        with patch.object(MODULE, "AGENT_RECORDS", records):
+            with patch.object(MODULE, "native_limits", return_value=([row], "Plus", "")):
+                with patch.object(MODULE, "live_limits_state",
+                                  return_value={"codex": {"fetchedAt": 1792900000.0}}):
+                    provider = MODULE.native_provider("codex", self.pricing)
+        self.assertEqual(provider["limitsCheckedAt"], 1792900000000)
+
+    def test_a_provider_without_a_probe_has_no_measurement_time(self):
+        records = self.root / "agents"
+        records.mkdir()
+        (records / "codex.json").write_text(json.dumps({"limits": [{"label": "Weekly (7-day)", "percent": 40}]}))
+        with patch.object(MODULE, "AGENT_RECORDS", records):
+            with patch.object(MODULE, "native_limits", return_value=([], "", "rate limited")):
+                provider = MODULE.native_provider("codex", self.pricing)
+        self.assertEqual(provider["limitsCheckedAt"], 0)
+        self.assertEqual(provider["limitsSource"], "record")

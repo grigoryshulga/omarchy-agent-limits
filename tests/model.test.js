@@ -59,4 +59,11 @@ assert(hours[1].value === 10, "hourly bucket should aggregate providers")
 assert(hours[1].parts.length === 2, "hourly bucket should keep provider parts")
 assert(hours[0].parts.length === 0, "an empty hour should have no parts")
 
+const now = Date.now()
+assert(model.elapsedLabel(now - 30 * 1000, now, strings) === "now", "a fresh measurement reads as now")
+assert(model.elapsedLabel(now - 5 * 60 * 1000, now, strings) === "5m", "minutes-old measurements keep their minutes")
+assert(model.elapsedLabel(now - 95 * 60 * 1000, now, strings) === "1h 35m", "hours keep the leftover minutes")
+assert(model.elapsedLabel(now - 27 * 3600 * 1000, now, strings) === "1d 3h", "days keep the leftover hours")
+assert(model.elapsedLabel(0, now, strings) === "", "an unmeasured provider says nothing")
+
 console.log("model tests passed")
