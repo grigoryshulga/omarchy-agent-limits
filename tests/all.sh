@@ -26,7 +26,7 @@ else
   # the entry point shadowing qs.Ui.Panel the way every first-party plugin
   # does); only hard errors fail the run.
   output="$("$qmllint" -I "$shell_path" Panel.qml Dashboard.qml EmbeddedPage.qml \
-    Service.qml PlainText.qml DailyChart.qml 2>&1 || true)"
+    Service.qml PlainText.qml DailyChart.qml ProviderSettings.qml 2>&1 || true)"
   echo "$output" | grep -v '^$' | grep -c 'Warning:' | sed 's/^/qmllint warnings: /' || true
   if echo "$output" | grep -q 'Error:'; then
     echo "$output" | grep 'Error:'

@@ -27,7 +27,7 @@ Item {
   }
   Process {
     id: syncProcess
-    command: [root.pluginDir + "bin/omarchy-agent-limits-sync", "sync"]
+    command: [Qt.resolvedUrl("bin/omarchy-agent-limits-sync").toString().replace("file://", ""), "sync"]
     // The cache is written through a temporary file and renamed into place, so
     // an inotify watch follows the old inode and stops reporting changes.
     // Reading the file again as soon as the writer exits keeps the view current.

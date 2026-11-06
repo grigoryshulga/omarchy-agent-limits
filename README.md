@@ -1,7 +1,8 @@
 # Agent Limits for Omarchy
 
 A compact, theme-aware monitor for **OpenCode Go, Z.AI Coding Plan, Claude Pro,
-ChatGPT Plus/Codex, and DeepSeek API**. It provides the same three views in the
+ChatGPT Plus/Codex, DeepSeek API, OpenRouter, Kimi Code, Moonshot API, MiniMax
+Token Plan, OpenAI API, and Google Gemini API**. It provides the same three views in the
 Omarchy bar, Omarchy Dashboard, and Omarchy Side Panel:
 
 1. **Limits** — remaining quota and reset times for every provider; DeepSeek's
@@ -53,6 +54,64 @@ When a provider shows quota pressure but no readable log (OpenCode Go today),
 its breakdown row prints `—` with `no local usage log` instead of a false
 `0 requests / $0.00`.
 
+## Provider settings
+
+Open the gear button in the popup, Dashboard tile, or Side Panel page. The
+same menu lists all eleven supported providers. **Add / enable** restores a
+provider, **Disable** hides it and stops its quota/credential probes, and the
+up/down arrows set card order across all views. Settings are saved immediately
+to `~/.config/omarchy/agent-limits.json` (`providers.<id>.enabled` and
+`providerOrder`); other configuration, including custom pricing, is preserved.
+The original five providers remain enabled by default. New catalog entries are
+disabled until you connect or enable them.
+
+Adding uses an existing login or secret, as described in the menu. Claude and
+Codex need their CLI login; API providers use OpenCode authentication or
+Bitwarden Secrets Manager. A missing login/key appears as an error on the
+enabled card. Disabling keeps connection parameters for enabling later.
+
+For scripts, `bin/omarchy-agent-limits-sync providers` returns only the public
+catalog and enabled state. `configure <id> <enable|disable|up|down>` saves a
+change under the sync lock; run `sync` afterwards to refresh measurements.
+
+### Connecting a catalog provider
+
+Choose **Connect**, enter the **name** of its Bitwarden Secrets Manager secret,
+and select Global or China where offered. **Save and connect** stores only that
+reference and region, enables the card, and refreshes the snapshot. The existing
+OpenCode authentication and environment lookup still take priority. Connection
+settings can be edited with the small gear next to each API provider.
+
+| Provider | Data shown | Default secret name |
+|---|---|---|
+| OpenRouter | API key budget; an unlimited key has no quota percentage | `OPENROUTER_API_KEY` |
+| Kimi Code | Code subscription quota windows | `KIMI_CODE_API_KEY` |
+| Kimi / Moonshot API | Available account balance, USD globally or CNY in China | `MOONSHOT_API_KEY` |
+| MiniMax Token Plan | Readable text-model 5-hour and weekly quotas | `MINIMAX_API_KEY` |
+| OpenAI API | Local OpenCode/pi usage and recorded or configured cost | No remote credentials needed |
+| Google Gemini API | Local OpenCode/pi usage and recorded or configured cost | No remote credentials needed |
+
+Kimi Code and Moonshot API have separate keys. MiniMax requires a subscription
+key, not a pay-as-you-go key. MiniMax responses containing zero quota totals
+are reported as unavailable, rather than guessed to mean full or empty.
+OpenAI API and Gemini cards collect local API traffic only; Codex and Gemini CLI
+subscription traffic is excluded. Models absent from the pricing table remain
+unpriced unless their log records a cost. Local usage does not represent the
+account's global billed spend.
+
+The collectors follow the official [OpenRouter key API](https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key),
+[Moonshot balance API](https://platform.kimi.ai/docs/api/balance),
+[Kimi Code usage implementation](https://github.com/MoonshotAI/kimi-code/blob/main/packages/oauth/src/managed-usage.ts),
+and [MiniMax quota endpoint](https://platform.minimax.io/docs/m-plan/faq).
+MiniMax count-based parsing treats `current_interval_usage_count` as remaining,
+as described in the [provider issue](https://github.com/MiniMax-AI/MiniMax-M2/issues/99).
+New remote probes cache successful aggregate results for five minutes and back
+off failures for at least ten minutes, honoring longer `Retry-After` values.
+Changing a connection clears its probe cache.
+
+CLI equivalent: `configure openrouter connect --secret-name OPENROUTER_API_KEY`.
+Regional providers also accept `--region global` or `--region cn`.
+
 ## How it works
 
 The plugin is two halves and one file between them. Nothing else couples them:
@@ -73,8 +132,8 @@ One run of `sync`:
 2. `credentials()` resolves each provider independently — process environment,
    then OpenCode's `auth.json`, then the private runtime cache, then Bitwarden.
    A provider that cannot be resolved takes its own error with it.
-3. Remote checks run concurrently (OpenCode Go, Z.AI, DeepSeek in a three-thread
-   pool; Claude and Codex through the probe cache described above).
+3. API provider checks run in a three-thread pool; Claude and Codex use the
+   native probe cache described above.
 4. Local ledgers are read and **added**: `opencode_ledger()` reads the OpenCode
    database, `pi_ledger()` reads pi's session logs, `claude_ledger()` and
    `codex_ledger()` read the CLIs' own session logs; `merge_ledger()` sums them
@@ -101,7 +160,7 @@ quietly, which makes it safe to call from several surfaces at once.
 |---|---|
 | `limits[]` | `label`, `percent` (0–100, never a fraction), `remaining`, `exhausted`, `resetsAt` (ISO UTC, empty when unknown) |
 | `limitsSource` | `live` (probed now) or `record` (Omarchy's snapshot, shown as `cached`) |
-| `balance[]` | DeepSeek's real `{currency, total, granted, toppedUp}` strings |
+| `balance[]` | Real account balance strings `{currency, total}`; DeepSeek also supplies `granted` and `toppedUp` |
 | `today` / `week` / `total` | `tokens`, `input`, `output`, `cacheRead`, `cacheWrite`, `cost`, `priced`, `requests`, `sessions` |
 | `days[]` / `hours[]` | 30 daily and 24 hourly buckets with the same metric keys |
 | `models[]` | Top 20 model rows, already priced and sorted |

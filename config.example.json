@@ -1,10 +1,16 @@
 {
   "providers": {
-    "opencode-go": { "enabled": true, "secretKey": "OPENCODE_GO_API_KEY", "plan": "Go" },
-    "zai": { "enabled": true, "secretKey": "ZAI_API_KEY", "region": "global" },
-    "claude": { "enabled": true },
-    "codex": { "enabled": true },
-    "deepseek": { "enabled": true, "secretKey": "DEEPSEEK_API_KEY" }
+    "opencode-go": {"enabled": true, "secretKey": "OPENCODE_GO_API_KEY", "plan": "Go"},
+    "zai": {"enabled": true, "secretKey": "ZAI_API_KEY", "region": "global"},
+    "claude": {"enabled": true},
+    "codex": {"enabled": true},
+    "deepseek": {"enabled": true, "secretKey": "DEEPSEEK_API_KEY"},
+    "openrouter": {"enabled": false, "secretKey": "OPENROUTER_API_KEY"},
+    "kimi-code": {"enabled": false, "secretKey": "KIMI_CODE_API_KEY", "region": "global"},
+    "moonshot": {"enabled": false, "secretKey": "MOONSHOT_API_KEY", "region": "global"},
+    "minimax": {"enabled": false, "secretKey": "MINIMAX_API_KEY", "region": "global"},
+    "openai-api": {"enabled": false},
+    "gemini": {"enabled": false}
   },
 
   "_pricing": "USD per million tokens. Anthropic rows are the first-party list prices (base input, output, 5m cache write, cache hit). OpenAI rows are the Standard short-context prices; a '-fast' suffix is the Fast-mode price, which is twice the Standard rate. Models missing here are reported as unpriced instead of being guessed.",

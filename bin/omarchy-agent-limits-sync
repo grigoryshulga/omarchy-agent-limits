@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -42,7 +43,10 @@ PI_SESSIONS = HOME / ".pi/agent/sessions"
 # already cover (claude-bridge, openai-codex) is excluded to avoid double
 # counting the same request twice.
 PI_PROVIDERS = {"deepseek": "deepseek", "zai": "zai", "zhipu": "zai", "z-ai": "zai",
-                "opencode-go": "opencode-go", "opencode": "opencode-go"}
+                "opencode-go": "opencode-go", "opencode": "opencode-go",
+                "openrouter": "openrouter", "kimi-coding": "kimi-code", "kimi-code": "kimi-code",
+                "moonshot": "moonshot", "moonshotai": "moonshot",
+                "minimax-coding-plan": "minimax", "openai": "openai-api", "google": "gemini"}
 # Claude Code and Codex keep their own session logs with per-turn usage, which is
 # fresher than Omarchy's aggregated record and needs no hook to update.
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
@@ -64,15 +68,22 @@ CODEX_RPC_TIMEOUT = 7
 LIVE_LIMITS_STATE = RUNTIME_DIR / "live-limits.json"
 LIVE_LIMITS_TTL = {"claude": 300, "codex": 240}
 LIVE_LIMITS_BACKOFF = 600
+LIVE_LIMITS_LOCK = threading.Lock()
 USER_AGENT = "omarchy-agent-limits/1.0"
-PROVIDERS = ("opencode-go", "zai", "claude", "codex", "deepseek")
+DEFAULT_PROVIDERS = ("opencode-go", "zai", "claude", "codex", "deepseek")
+PROVIDERS = DEFAULT_PROVIDERS + ("openrouter", "kimi-code", "moonshot", "minimax", "openai-api", "gemini")
+API_PROVIDERS = ("opencode-go", "zai", "deepseek", "openrouter", "kimi-code", "moonshot", "minimax", "openai-api", "gemini")
 NAMES = {
     "opencode-go": "OpenCode Go", "zai": "Z.AI Coding Plan",
     # The Codex quota is what a ChatGPT Plus subscription buys for coding, and
     # that is the only ChatGPT number any API reports; name it for both.
     "claude": "Claude Pro", "codex": "ChatGPT / Codex", "deepseek": "DeepSeek API",
+    "openrouter": "OpenRouter", "kimi-code": "Kimi Code", "moonshot": "Kimi / Moonshot API", "minimax": "MiniMax Token Plan",
+    "openai-api": "OpenAI API", "gemini": "Google Gemini API",
 }
-SECRET_DEFAULTS = {"opencode-go": "OPENCODE_GO_API_KEY", "zai": "ZAI_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+SECRET_DEFAULTS = {"opencode-go": "OPENCODE_GO_API_KEY", "zai": "ZAI_API_KEY", "deepseek": "DEEPSEEK_API_KEY",
+                   "openrouter": "OPENROUTER_API_KEY", "kimi-code": "KIMI_CODE_API_KEY",
+                   "moonshot": "MOONSHOT_API_KEY", "minimax": "MINIMAX_API_KEY"}
 # The configured `secretKey` is tried first; these aliases cover the names the
 # same subscription is commonly filed under in a Bitwarden project (e.g. an
 # OpenCode Go key stored as a personal READ_ONLY key). Only the providers that
@@ -81,6 +92,8 @@ SECRET_ALIASES = {
     "opencode-go": ("OPENCODE_GO_API_KEY", "OPENCODE_ZEN_API_KEY", "READ_ONLY_OPENCODE_API_KEY"),
     "zai": ("ZAI_API_KEY", "ZHIPUAI_API_KEY", "GLM_API_KEY"),
     "deepseek": ("DEEPSEEK_API_KEY",),
+    "openrouter": ("OPENROUTER_API_KEY",), "kimi-code": ("KIMI_CODE_API_KEY",),
+    "moonshot": ("MOONSHOT_API_KEY",), "minimax": ("MINIMAX_API_KEY", "MINIMAX_CODING_PLAN_API_KEY"),
 }
 
 
@@ -139,7 +152,7 @@ def empty_provider(provider_id: str) -> dict[str, Any]:
 
 def empty_cache() -> dict[str, Any]:
     return {"schemaVersion": 1, "state": "loading", "syncedAt": 0,
-            "providers": [empty_provider(p) for p in PROVIDERS], "error": ""}
+            "providers": [empty_provider(p) for p in DEFAULT_PROVIDERS], "error": ""}
 
 
 def load_config() -> dict[str, Any]:
@@ -152,10 +165,74 @@ def load_config() -> dict[str, Any]:
     config.setdefault("pricing", defaults.get("pricing", {}))
     for provider in PROVIDERS:
         entry = config["providers"].setdefault(provider, {})
-        entry.setdefault("enabled", True)
+        entry.setdefault("enabled", provider in DEFAULT_PROVIDERS)
         if provider in SECRET_DEFAULTS:
             entry.setdefault("secretKey", SECRET_DEFAULTS[provider])
     return config
+
+
+
+def provider_order(config: dict[str, Any]) -> list[str]:
+    raw = config.get("providerOrder", [])
+    raw = raw if isinstance(raw, list) else []
+    order = []
+    for item in raw + list(PROVIDERS):
+        if isinstance(item, str) and item in PROVIDERS and item not in order:
+            order.append(item)
+    return order
+
+
+def provider_settings() -> dict[str, Any]:
+    """Expose only public catalog metadata, never the configuration itself."""
+    config = load_config()
+    return {"providers": [{"id": p, "name": NAMES[p],
+                           "enabled": bool(config["providers"][p].get("enabled", True)),
+                           "secretName": bounded_text(config["providers"][p].get("secretKey"), 100) if p in SECRET_DEFAULTS else "",
+                           "region": "cn" if config["providers"][p].get("region") == "cn" else "global"}
+                          for p in provider_order(config)]}
+
+
+def configure_provider(provider_id: str, action: str, secret_name: str | None = None, region: str = "global") -> dict[str, Any]:
+    if provider_id not in PROVIDERS or action not in ("enable", "disable", "up", "down", "connect"):
+        raise SyncError("unknown provider or settings action")
+    if action == "connect" and (provider_id not in SECRET_DEFAULTS or not secret_name
+                                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,99}", secret_name)
+                                or region not in ("global", "cn")):
+        raise SyncError("invalid connection settings")
+    # Do not materialize defaults/pricing or discard unrelated user settings.
+    # Refuse malformed files rather than overwriting a configuration we cannot read.
+    raw = read_json(CONFIG, None) if CONFIG.exists() else {}
+    if not isinstance(raw, dict) or not isinstance(raw.get("providers", {}), dict):
+        raise SyncError("invalid provider configuration")
+    entries = raw.setdefault("providers", {})
+    if not isinstance(entries.get(provider_id, {}), dict):
+        raise SyncError("invalid provider configuration")
+    order = provider_order(raw)
+    if action == "connect":
+        entry = entries.setdefault(provider_id, {})
+        entry.update({"enabled": True, "secretKey": secret_name, "region": region})
+    elif action in ("enable", "disable"):
+        entries.setdefault(provider_id, {})["enabled"] = action == "enable"
+    else:
+        index = order.index(provider_id)
+        target = index + (-1 if action == "up" else 1)
+        if 0 <= target < len(order):
+            order[index], order[target] = order[target], order[index]
+    raw["providerOrder"] = order
+    atomic_json(CONFIG, raw)
+    if action == "connect":
+        state = live_limits_state()
+        for suffix in ("global", "cn"):
+            state.pop("catalog:" + provider_id + ":" + suffix, None)
+        atomic_json(LIVE_LIMITS_STATE, state)
+    # Apply visibility/order immediately, including when the next network sync
+    # fails. The caller holds the sync lock, so an older sync cannot undo this.
+    cache = read_json(CACHE, empty_cache())
+    current = {p["id"]: p for p in cache.get("providers", []) if isinstance(p, dict) and p.get("id") in PROVIDERS}
+    enabled = {p["id"] for p in provider_settings()["providers"] if p["enabled"]}
+    cache["providers"] = [current[p] for p in order if p in enabled and p in current]
+    atomic_json(CACHE, cache)
+    return provider_settings()
 
 
 def merge_metrics(target: dict[str, Any], source: dict[str, Any]) -> None:
@@ -543,13 +620,14 @@ def live_limits_state() -> dict[str, Any]:
 
 
 def remember_live_limits(provider_id: str, payload: dict[str, Any]) -> None:
-    state = live_limits_state()
-    state[provider_id] = payload
-    try:
-        atomic_json(LIVE_LIMITS_STATE, state)
-    except OSError:
-        # A cache that cannot be written only costs another probe.
-        pass
+    with LIVE_LIMITS_LOCK:
+        state = live_limits_state()
+        state[provider_id] = payload
+        try:
+            atomic_json(LIVE_LIMITS_STATE, state)
+        except OSError:
+            # A cache that cannot be written only costs another probe.
+            pass
 
 
 def cached_live_limits(provider_id: str, now: float | None = None) -> tuple[list[dict[str, Any]], str, str, bool]:
@@ -683,7 +761,7 @@ def native_provider(provider_id: str, config: dict[str, Any],
 
 
 def opencode_ledger(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    result = {p: {"days": {}, "models": {}, "total": empty_metrics(), "hours": {}} for p in ("opencode-go", "zai", "deepseek")}
+    result = {p: {"days": {}, "models": {}, "total": empty_metrics(), "hours": {}} for p in API_PROVIDERS}
     database = DATA_HOME / "opencode/opencode.db"
     if not database.is_file():
         return result
@@ -694,7 +772,9 @@ def opencode_ledger(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
         aliases = {
             "opencode-go": "opencode-go", "opencode_go": "opencode-go",
             "zai-coding-plan": "zai", "zai": "zai", "zhipu": "zai",
-            "deepseek": "deepseek",
+            "deepseek": "deepseek", "openrouter": "openrouter",
+            "kimi-for-coding": "kimi-code", "kimi-code": "kimi-code", "moonshotai": "moonshot",
+            "minimax-coding-plan": "minimax", "openai": "openai-api", "google": "gemini",
         }
         sessions: dict[str, set[str]] = {p: set() for p in result}
         for (raw, created) in rows:
@@ -909,7 +989,7 @@ def pi_ledger(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     returned, which keeps requests and spend exact rather than estimated.
     """
     result = {provider_id: {"days": {}, "models": {}, "total": empty_metrics(), "hours": {}}
-              for provider_id in ("opencode-go", "zai", "deepseek")}
+              for provider_id in API_PROVIDERS}
     pricing = config.get("pricing", {})
     if not PI_SESSIONS.is_dir():
         return result
@@ -1005,7 +1085,9 @@ def auth_file_key(provider_id: str) -> str:
             return os.environ[name].strip()
     auth = read_json(DATA_HOME / "opencode/auth.json", {})
     provider_names = {"opencode-go": ("opencode-go",), "zai": ("zai-coding-plan", "zai", "zhipu"),
-                      "deepseek": ("deepseek",)}[provider_id]
+                      "deepseek": ("deepseek",), "openrouter": ("openrouter",),
+                      "kimi-code": ("kimi-for-coding", "kimi-code"), "moonshot": ("moonshotai",),
+                      "minimax": ("minimax-coding-plan",)}[provider_id]
     for name in provider_names:
         entry = auth.get(name) if isinstance(auth, dict) else None
         if isinstance(entry, dict) and str(entry.get("key", "")).strip():
@@ -1151,7 +1233,8 @@ def credentials(config: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]
 
 def request_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
     parsed = urllib.parse.urlparse(url)
-    allowed = {"opencode.ai", "api.z.ai", "open.bigmodel.cn", "api.deepseek.com", "api.anthropic.com"}
+    allowed = {"opencode.ai", "api.z.ai", "open.bigmodel.cn", "api.deepseek.com", "api.anthropic.com", "openrouter.ai", "api.moonshot.ai", "api.moonshot.cn",
+               "api.kimi.ai", "api.kimi.com", "www.minimax.io", "www.minimaxi.com"}
     if parsed.scheme != "https" or parsed.hostname not in allowed:
         raise SyncError("refused an untrusted provider endpoint")
     request = urllib.request.Request(url, headers={**headers, "Accept": "application/json", "User-Agent": USER_AGENT})
@@ -1250,6 +1333,132 @@ def collect_deepseek(key: str) -> tuple[list[dict[str, Any]], bool]:
     return balances, bool(data.get("is_available"))
 
 
+def measured_number(value: Any) -> float:
+    result = number(value, float("nan"))
+    if isinstance(value, bool) or not math.isfinite(result):
+        raise SyncError("provider returned an invalid measurement")
+    return result
+
+
+def counted_limit(label: str, used: Any, total: Any, reset: Any = "") -> dict[str, Any]:
+    capacity = measured_number(total)
+    consumed = measured_number(used)
+    if capacity <= 0 or consumed < 0:
+        raise SyncError("provider returned an invalid quota")
+    row = limit_row(label, consumed / capacity * 100, reset)
+    row.update({"used": consumed, "total": capacity})
+    return row
+
+
+def catalog_probe(provider_id: str, key: str, region: str = "global") -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    cache_id = "catalog:" + provider_id + ":" + region
+    state = live_limits_state().get(cache_id, {})
+    now = time.time()
+    if isinstance(state, dict):
+        if now < number(state.get("retryAt")):
+            raise SyncError(bounded_text(state.get("error")) or "provider usage check is waiting")
+        if now - number(state.get("fetchedAt")) < 300 and isinstance(state.get("result"), list):
+            return tuple(state["result"])
+    try:
+        result = collect_catalog_provider(provider_id, key, region)
+    except SyncError as exc:
+        remember_live_limits(cache_id, {"retryAt": now + max(LIVE_LIMITS_BACKOFF, exc.retry_after), "error": bounded_text(str(exc))})
+        raise
+    remember_live_limits(cache_id, {"fetchedAt": now, "result": result})
+    return result
+
+
+def collect_catalog_provider(provider_id: str, key: str, region: str = "global") -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    headers = {"Authorization": f"Bearer {key}"}
+    if provider_id == "openrouter":
+        payload = request_json("https://openrouter.ai/api/v1/key", headers)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict) or "usage" not in data:
+            raise SyncError("OpenRouter returned an unexpected key response")
+        measured_number(data["usage"])
+        # An unlimited key has no percentage. A key budget is not the wallet
+        # balance, and its reset interval alone does not tell us a reset date.
+        if data.get("limit") is None:
+            return [], [], "API · unlimited key"
+        total = measured_number(data["limit"])
+        remaining = measured_number(data.get("limit_remaining"))
+        if total < 0:
+            raise SyncError("OpenRouter returned an invalid key budget")
+        if total == 0:
+            return [limit_row("Key budget (USD)", 100, "")], [], "API"
+        row = counted_limit("Key budget (USD)", max(0, total - remaining), total)
+        row["unit"] = "USD"
+        return [row], [], "API"
+    if provider_id == "moonshot":
+        host = "api.moonshot.cn" if region == "cn" else "api.moonshot.ai"
+        payload = request_json(f"https://{host}/v1/users/me/balance", headers)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict) or payload.get("status") is False or payload.get("code", 0) != 0:
+            raise SyncError("Moonshot rejected the balance check")
+        balance = measured_number(data.get("available_balance"))
+        return [], [{"currency": "CNY" if region == "cn" else "USD", "total": bounded_text(balance, 30)}], "API"
+    if provider_id == "kimi-code":
+        host = "api.kimi.com" if region == "cn" else "api.kimi.ai"
+        payload = request_json(f"https://{host}/coding/v1/usages", headers)
+        if not isinstance(payload, dict) or payload.get("error"):
+            raise SyncError("Kimi Code returned an unexpected quota response")
+        rows = []
+        usages = payload.get("usages")
+        if isinstance(usages, dict):
+            for field, label in (("limit_5h", "Session (5-hour)"), ("limit_7d", "Weekly (7-day)"),
+                                 ("limit_month_total", "Monthly total"), ("limit_month_code", "Monthly code")):
+                item = usages.get(field)
+                if isinstance(item, dict) and item.get("used_ratio") is not None:
+                    rows.append(limit_row(label, measured_number(item["used_ratio"]) * 100, item.get("reset_time")))
+        else:
+            # Earlier Kimi Code versions returned count-based windows.
+            usage = payload.get("usage")
+            if isinstance(usage, dict):
+                rows.append(counted_limit("Quota", usage.get("used"), usage.get("limit"), usage.get("resetTime")))
+            limits = payload.get("limits", [])
+            for item in limits[:10] if isinstance(limits, list) else []:
+                if not isinstance(item, dict) or not isinstance(item.get("detail"), dict):
+                    continue
+                window = item.get("window") or {}
+                duration = integer(window.get("duration"))
+                unit = "m" if window.get("timeUnit") == "TIME_UNIT_MINUTE" else "h" if window.get("timeUnit") == "TIME_UNIT_HOUR" else ""
+                detail = item["detail"]
+                rows.append(counted_limit(f"{duration}{unit} window" if duration and unit else "Quota window",
+                                          detail.get("used"), detail.get("limit"), detail.get("resetTime")))
+        if not rows:
+            raise SyncError("Kimi Code returned no readable quotas")
+        return rows, [], "Code"
+    if provider_id == "minimax":
+        host = "www.minimaxi.com" if region == "cn" else "www.minimax.io"
+        payload = request_json(f"https://{host}/v1/token_plan/remains", headers)
+        if not isinstance(payload, dict) or not isinstance(payload.get("base_resp"), dict) or payload["base_resp"].get("status_code") != 0:
+            raise SyncError("MiniMax rejected the plan usage check")
+        items = payload.get("model_remains")
+        if not isinstance(items, list):
+            raise SyncError("MiniMax returned no readable quotas")
+        rows = []
+        for item in items[:20]:
+            if not isinstance(item, dict):
+                continue
+            model = bounded_text(item.get("model_name"), 60)
+            if model.lower() != "general" and not model.lower().startswith("minimax-m"):
+                continue
+            for prefix, label, reset in (("current_interval", "Session (5-hour)", "end_time"),
+                                         ("current_weekly", "Weekly (7-day)", "weekly_end_time")):
+                total = number(item.get(prefix + "_total_count"))
+                # Despite its name, usage_count is quota LEFT, not spent.
+                if total > 0:
+                    remaining = measured_number(item.get(prefix + "_usage_count"))
+                    rows.append(counted_limit(label + " · " + model, max(0, total - remaining), total, item.get(reset)))
+            if rows:
+                break
+        if not rows:
+            # Zero totals are not evidence of an empty or full subscription.
+            raise SyncError("MiniMax returned no readable quota amounts")
+        return rows, [], "Token Plan"
+    raise SyncError("unknown provider")
+
+
 def preserve_on_error(fresh: dict[str, Any], previous: dict[str, Any], message: str) -> None:
     # Keep local metrics from this run, but retain last-known remote limits.
     for field in ("limits", "balance", "plan"):
@@ -1282,6 +1491,9 @@ def sync() -> dict[str, Any]:
             futures[pool.submit(collect_zai, keys["zai"], config["providers"]["zai"].get("region", "global"))] = "zai"
         if "deepseek" in keys:
             futures[pool.submit(collect_deepseek, keys["deepseek"])] = "deepseek"
+        for new_id in ("openrouter", "kimi-code", "moonshot", "minimax"):
+            if new_id in keys:
+                futures[pool.submit(catalog_probe, new_id, keys[new_id], config["providers"][new_id].get("region", "global"))] = new_id
         for future in concurrent.futures.as_completed(futures):
             provider_id = futures[future]
             try:
@@ -1290,26 +1502,32 @@ def sync() -> dict[str, Any]:
                 remote_results[provider_id] = exc
             except Exception:
                 remote_results[provider_id] = SyncError("unexpected provider response")
-    for provider_id in PROVIDERS:
+    for provider_id in provider_order(config):
         if not config["providers"][provider_id].get("enabled", True):
             continue
         if provider_id in ("claude", "codex"):
             provider = native_provider(provider_id, config, native_ledgers.get(provider_id))
         else:
             provider = empty_provider(provider_id)
-            apply_ledger(provider, ledger[provider_id])
+            apply_ledger(provider, ledger.get(provider_id, empty_harness_ledger()))
             if provider_id == "zai":
                 provider["plan"] = bounded_text(config["providers"]["zai"].get("plan"), 40)
             if provider_id == "opencode-go":
                 provider["plan"] = bounded_text(config["providers"]["opencode-go"].get("plan", "Go"), 40)
+            if provider_id in ("openai-api", "gemini"):
+                provider["plan"] = "Local usage"
             remote = remote_results.get(provider_id)
             error = credential_errors.get(provider_id)
-            if provider_id not in keys and not error:
+            if provider_id in SECRET_DEFAULTS and provider_id not in keys and not error:
                 error = "credential not found; connect OpenCode or configure Bitwarden"
             if isinstance(remote, SyncError):
                 error = str(remote)
             elif remote is not None:
-                if provider_id == "deepseek":
+                if provider_id in ("openrouter", "kimi-code", "moonshot", "minimax"):
+                    provider["limits"], provider["balance"], provider["plan"] = remote
+                    if provider["limits"]:
+                        provider["limitsSource"] = "live"
+                elif provider_id == "deepseek":
                     provider["balance"], available = remote
                     provider["plan"] = "API" if available else "Balance exhausted"
                 else:
@@ -1319,10 +1537,17 @@ def sync() -> dict[str, Any]:
                 # These limits were asked for in this run, so they are fresh.
                 if provider["limits"]:
                     provider["limitsCheckedAt"] = provider["syncedAt"]
+                    if provider_id in ("openrouter", "kimi-code", "minimax"):
+                        region = config["providers"][provider_id].get("region", "global")
+                        probe = live_limits_state().get("catalog:" + provider_id + ":" + region, {})
+                        if isinstance(probe, dict) and number(probe.get("fetchedAt")) > 0:
+                            provider["limitsCheckedAt"] = integer(number(probe["fetchedAt"]) * 1000)
             if error:
                 preserve_on_error(provider, previous.get(provider_id, {}), error)
             else:
                 provider["status"] = "ready"
+        if provider_id in ("kimi-code", "minimax"):
+            roll_expired_limits(provider)
         output.append(provider)
     cache = {"schemaVersion": 1, "state": "ready" if output else "setup",
              "syncedAt": int(time.time() * 1000), "providers": output, "error": ""}
@@ -1332,8 +1557,17 @@ def sync() -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", default="sync", choices=("sync", "snapshot"))
+    parser.add_argument("command", nargs="?", default="sync", choices=("sync", "snapshot", "providers", "configure"))
+    parser.add_argument("provider", nargs="?", choices=PROVIDERS)
+    parser.add_argument("action", nargs="?", choices=("enable", "disable", "up", "down", "connect"))
+    parser.add_argument("--secret-name")
+    parser.add_argument("--region", choices=("global", "cn"), default="global")
     args = parser.parse_args()
+    if args.command == "providers":
+        print(json.dumps(provider_settings(), ensure_ascii=False))
+        return 0
+    if args.command == "configure" and (not args.provider or not args.action):
+        parser.error("configure requires a provider and action")
     if args.command == "snapshot":
         print(json.dumps(read_json(CACHE, empty_cache()), ensure_ascii=False))
         return 0
@@ -1341,8 +1575,16 @@ def main() -> int:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if args.command == "configure" else fcntl.LOCK_NB))
         except BlockingIOError:
+            return 0
+        if args.command == "configure":
+            try:
+                result = configure_provider(args.provider, args.action, args.secret_name, args.region)
+            except Exception:
+                print("could not save provider settings", file=sys.stderr)
+                return 1
+            print(json.dumps(result, ensure_ascii=False))
             return 0
         try:
             result = sync()

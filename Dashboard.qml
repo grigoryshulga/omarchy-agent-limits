@@ -22,6 +22,7 @@ Column {
   // Time preset shared by the Usage and Cost tabs: it drives the headline, the
   // stat tiles, the chart and the per-provider rows at once.
   property string range: "week"
+  property bool settingsOpen: false
   signal refreshRequested()
 
   readonly property var providers: cache.providers || []
@@ -130,7 +131,9 @@ Column {
     implicitHeight: Math.max(titleText.implicitHeight, refreshButton.implicitHeight)
     PlainText {
       id: titleText
-      text: strings.t("hero.title")
+      text: strings.t(root.settingsOpen ? "settings.title" : "hero.title")
+      width: Math.min(implicitWidth, Math.max(0, parent.width - settingsButton.width - refreshButton.width - Style.space(18)))
+      elide: Text.ElideRight
       color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.title; font.bold: true
       anchors.left: parent.left
       anchors.verticalCenter: parent.verticalCenter
@@ -139,12 +142,23 @@ Column {
     PlainText {
       text: Model.updatedLabel(root.cache, root.nowMs, root.syncing, strings)
       color: root.muted; font.family: root.fontFamily; font.pixelSize: Style.font.caption
-      anchors.right: refreshButton.left
+      anchors.right: settingsButton.left
       anchors.rightMargin: Style.space(9)
       anchors.verticalCenter: parent.verticalCenter
-      width: Math.max(0, parent.width - titleText.implicitWidth - refreshButton.width - Style.space(24))
+      width: Math.max(0, parent.width - titleText.implicitWidth - refreshButton.width - settingsButton.width - Style.space(32))
       horizontalAlignment: Text.AlignRight
       elide: Text.ElideRight
+    }
+    PanelActionButton {
+      id: settingsButton
+      anchors.right: refreshButton.left
+      anchors.rightMargin: Style.space(6)
+      anchors.top: parent.top
+      iconText: root.settingsOpen ? "󰅖" : "󰒓"
+      tooltipText: Model.escapeMarkup(strings.t(root.settingsOpen ? "settings.back" : "settings.title"))
+      foreground: root.foreground
+      focusable: true
+      onClicked: root.settingsOpen = !root.settingsOpen
     }
     PanelActionButton {
       id: refreshButton
@@ -160,7 +174,14 @@ Column {
     }
   }
 
+  ProviderSettings {
+    width: parent.width
+    visible: root.settingsOpen
+    onChanged: root.refreshRequested()
+  }
+
   Item {
+    visible: !root.settingsOpen
     width: parent.width
     implicitHeight: Math.max(tabs.implicitHeight, presets.implicitHeight)
     Row {
@@ -193,7 +214,7 @@ Column {
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       spacing: Style.space(1)
-      visible: root.tab !== "limits"
+      visible: !root.settingsOpen && root.tab !== "limits"
       Repeater {
         model: ["today", "week", "month"]
         Button {
@@ -212,10 +233,10 @@ Column {
     }
   }
 
-  PanelSeparator { foreground: root.foreground }
+  PanelSeparator { visible: !root.settingsOpen; foreground: root.foreground }
 
   PlainText {
-    visible: root.providers.length === 0
+    visible: !root.settingsOpen && root.providers.length === 0
     width: parent.width
     text: root.cache.error || strings.t("summary.noData")
     color: root.muted
@@ -226,7 +247,7 @@ Column {
 
   // Limits are deliberately first and remain compact enough for a Dashboard tile.
   Column {
-    visible: root.tab === "limits"
+    visible: !root.settingsOpen && root.tab === "limits"
     width: parent.width
     spacing: Style.space(11)
     Repeater {
@@ -302,7 +323,7 @@ Column {
 
   // Usage / Cost share a dense breakdown and a 30-day trend.
   Column {
-    visible: root.tab !== "limits" && root.providers.length > 0
+    visible: !root.settingsOpen && root.tab !== "limits" && root.providers.length > 0
     width: parent.width
     spacing: Style.space(13)
     Row {

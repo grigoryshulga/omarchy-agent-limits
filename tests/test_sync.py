@@ -613,3 +613,247 @@ class HarnessLedgerTests(unittest.TestCase):
                 provider = MODULE.native_provider("codex", self.pricing)
         self.assertEqual(provider["limitsCheckedAt"], 0)
         self.assertEqual(provider["limitsSource"], "record")
+
+
+class ProviderSettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        for name, path in (("CONFIG", "config.json"), ("CACHE", "data.json"), ("LIVE_LIMITS_STATE", "live.json")):
+            patcher = patch.object(MODULE, name, self.root / path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_catalog_never_exposes_configuration_or_credentials(self):
+        MODULE.atomic_json(MODULE.CONFIG, {"providers": {"zai": {"secretKey": "PRIVATE_NAME", "token": "PRIVATE_VALUE"}}, "pricing": {"custom": {"input": 3}}})
+        result = MODULE.provider_settings()
+        self.assertEqual(len(result["providers"]), len(MODULE.PROVIDERS))
+        self.assertNotIn("PRIVATE_VALUE", json.dumps(result))
+        self.assertEqual(set(result["providers"][0]), {"id", "name", "enabled", "secretName", "region"})
+
+    def test_disable_and_enable_preserve_other_configuration(self):
+        original = {"providers": {"zai": {"region": "cn", "secretKey": "CUSTOM_NAME"}}, "pricing": {"custom": {"input": 3}}, "extra": 42}
+        MODULE.atomic_json(MODULE.CONFIG, original)
+        MODULE.configure_provider("zai", "disable")
+        self.assertFalse(MODULE.load_config()["providers"]["zai"]["enabled"])
+        MODULE.configure_provider("zai", "enable")
+        saved = MODULE.read_json(MODULE.CONFIG, {})
+        self.assertTrue(saved["providers"]["zai"].pop("enabled"))
+        saved.pop("providerOrder")
+        self.assertEqual(saved, original)
+
+    def test_order_is_completed_deduplicated_and_validated(self):
+        self.assertEqual(MODULE.provider_order({"providerOrder": ["codex", "bad", "codex", {}, None]}),
+                         ["codex", "opencode-go", "zai", "claude", "deepseek"] + list(MODULE.PROVIDERS[len(MODULE.DEFAULT_PROVIDERS):]))
+        self.assertEqual(MODULE.provider_order({"providerOrder": "codex"}), list(MODULE.PROVIDERS))
+
+    def test_move_persists_order_and_updates_snapshot(self):
+        MODULE.atomic_json(MODULE.CACHE, MODULE.empty_cache())
+        MODULE.configure_provider("zai", "up")
+        expected = ["zai", "opencode-go", "claude", "codex", "deepseek"] + list(MODULE.PROVIDERS[len(MODULE.DEFAULT_PROVIDERS):])
+        self.assertEqual(MODULE.load_config()["providerOrder"], expected)
+        self.assertEqual([p["id"] for p in MODULE.read_json(MODULE.CACHE, {})["providers"]], expected[:len(MODULE.DEFAULT_PROVIDERS)])
+        MODULE.configure_provider("zai", "up")
+        self.assertEqual(MODULE.load_config()["providerOrder"], expected)
+        MODULE.configure_provider("zai", "down")
+        self.assertEqual(MODULE.load_config()["providerOrder"], list(MODULE.PROVIDERS))
+
+    def test_disable_removes_cached_card_even_before_sync(self):
+        MODULE.atomic_json(MODULE.CACHE, MODULE.empty_cache())
+        MODULE.configure_provider("claude", "disable")
+        self.assertNotIn("claude", [p["id"] for p in MODULE.read_json(MODULE.CACHE, {})["providers"]])
+
+    def test_invalid_action_cannot_change_files(self):
+        for provider, action in (("unknown", "enable"), ("zai", "delete")):
+            with self.assertRaises(MODULE.SyncError):
+                MODULE.configure_provider(provider, action)
+        self.assertFalse(MODULE.CONFIG.exists())
+
+    def test_invalid_config_is_preserved(self):
+        MODULE.CONFIG.write_text("{broken")
+        with self.assertRaises(MODULE.SyncError):
+            MODULE.configure_provider("zai", "disable")
+        self.assertEqual(MODULE.CONFIG.read_text(), "{broken")
+
+    def test_disabled_providers_make_no_credential_or_native_probe(self):
+        MODULE.atomic_json(MODULE.CONFIG, {"providers": {p: {"enabled": False} for p in MODULE.PROVIDERS}})
+        config = MODULE.load_config()
+        with patch.object(MODULE, "auth_file_key") as auth, patch.object(MODULE, "subprocess") as bws:
+            self.assertEqual(MODULE.credentials(config), ({}, {}))
+            auth.assert_not_called()
+            bws.assert_not_called()
+        buckets = {p: {} for p in MODULE.PROVIDERS}
+        with patch.object(MODULE, "opencode_ledger", return_value=buckets), \
+             patch.object(MODULE, "pi_ledger", return_value={}), \
+             patch.object(MODULE, "claude_ledger", return_value={}), \
+             patch.object(MODULE, "codex_ledger", return_value={}), \
+             patch.object(MODULE, "native_provider") as native:
+            self.assertEqual(MODULE.sync()["providers"], [])
+            native.assert_not_called()
+
+    def test_sync_uses_saved_order_and_omits_disabled_cards(self):
+        MODULE.atomic_json(MODULE.CONFIG, {"providerOrder": ["codex", "claude"],
+            "providers": {p: {"enabled": p in ("claude", "codex")} for p in MODULE.PROVIDERS}})
+        with patch.object(MODULE, "opencode_ledger", return_value={}), \
+             patch.object(MODULE, "pi_ledger", return_value={}), \
+             patch.object(MODULE, "claude_ledger", return_value={}), \
+             patch.object(MODULE, "codex_ledger", return_value={}), \
+             patch.object(MODULE, "credentials", return_value=({}, {})), \
+             patch.object(MODULE, "native_provider", side_effect=lambda p, *args: MODULE.empty_provider(p)):
+            result = MODULE.sync()
+        self.assertEqual([p["id"] for p in result["providers"]], ["codex", "claude"])
+
+
+class CatalogCollectorTests(unittest.TestCase):
+    def collect(self, provider, payload, region="global"):
+        with patch.object(MODULE, "request_json", return_value=payload) as request:
+            result = MODULE.collect_catalog_provider(provider, "test-key", region)
+        self.assertEqual(request.call_args.args[1], {"Authorization": "Bearer test-key"})
+        return result
+
+    def test_openrouter_key_budget_is_not_account_balance(self):
+        limits, balance, plan = self.collect("openrouter", {"data": {"limit": "10", "limit_remaining": "7.5", "usage": 100}})
+        self.assertEqual(limits[0]["percent"], 25)
+        self.assertEqual(limits[0]["resetsAt"], "")
+        self.assertEqual(balance, [])
+
+    def test_openrouter_unlimited_key_has_no_fake_percentage(self):
+        self.assertEqual(self.collect("openrouter", {"data": {"limit": None, "usage": 12}})[0], [])
+
+    def test_moonshot_balance_and_region(self):
+        payload = {"code": 0, "status": True, "data": {"available_balance": "12.345"}}
+        self.assertEqual(self.collect("moonshot", payload)[1][0], {"currency": "USD", "total": "12.345"})
+        with patch.object(MODULE, "request_json", return_value=payload) as request:
+            result = MODULE.collect_catalog_provider("moonshot", "test-key", "cn")
+        self.assertIn("api.moonshot.cn/", request.call_args.args[0])
+        self.assertEqual(result[1][0]["currency"], "CNY")
+
+    def test_kimi_ratios_and_utc_reset(self):
+        limits, _, _ = self.collect("kimi-code", {"usages": {
+            "limit_5h": {"used_ratio": "0.25", "reset_time": "2099-01-01T12:00:00+05:00"},
+            "limit_7d": {"used_ratio": 0.8}}})
+        self.assertEqual([r["percent"] for r in limits], [25, 80])
+        self.assertEqual(limits[0]["resetsAt"], "2099-01-01T07:00:00+00:00")
+
+    def test_kimi_legacy_counts(self):
+        limits, _, _ = self.collect("kimi-code", {"usage": {"limit": "200", "used": "50"}, "limits": []})
+        self.assertEqual(limits[0]["percent"], 25)
+
+    def test_minimax_usage_count_means_remaining(self):
+        limits, _, _ = self.collect("minimax", {"base_resp": {"status_code": 0}, "model_remains": [
+            {"model_name": "speech", "current_interval_total_count": 100, "current_interval_usage_count": 0},
+            {"model_name": "MiniMax-M3", "current_interval_total_count": 1000, "current_interval_usage_count": 750,
+             "current_weekly_total_count": 5000, "current_weekly_usage_count": 1000, "end_time": 4070908800000}]})
+        self.assertEqual([r["percent"] for r in limits], [25, 80])
+        self.assertTrue(limits[0]["resetsAt"].startswith("2099-"))
+
+    def test_missing_or_bad_measurements_are_errors(self):
+        cases = [("openrouter", {"data": {"usage": 1, "limit": 10}}),
+                 ("openrouter", {"data": {"usage": None}}),
+                 ("moonshot", {"code": 1, "data": {"available_balance": 0}}),
+                 ("moonshot", {"data": {"available_balance": "nan"}}),
+                 ("kimi-code", {"usages": {"limit_5h": {"used_ratio": None}}}),
+                 ("kimi-code", {"usages": {"limit_5h": {"used_ratio": True}}}),
+                 ("minimax", {"base_resp": {"status_code": 1004}, "model_remains": []}),
+                 ("minimax", {"base_resp": {"status_code": 0}, "model_remains": [{"model_name": "general", "current_interval_total_count": 0}]})]
+        for provider, payload in cases:
+            with self.subTest(provider=provider, payload=payload), self.assertRaises(MODULE.SyncError):
+                self.collect(provider, payload)
+
+    def test_http_failure_is_not_an_empty_card(self):
+        with patch.object(MODULE, "request_json", side_effect=MODULE.SyncError("provider rate-limited the usage check", 90)):
+            with self.assertRaises(MODULE.SyncError) as error:
+                MODULE.collect_catalog_provider("openrouter", "test-key")
+        self.assertEqual(error.exception.retry_after, 90)
+
+
+class CatalogConnectionTests(unittest.TestCase):
+    setUp = ProviderSettingsTests.setUp
+
+    def test_new_providers_are_opt_in(self):
+        config = MODULE.load_config()
+        self.assertTrue(all(config["providers"][p]["enabled"] for p in MODULE.DEFAULT_PROVIDERS))
+        self.assertTrue(all(not config["providers"][p]["enabled"] for p in MODULE.PROVIDERS if p not in MODULE.DEFAULT_PROVIDERS))
+
+    def test_connect_saves_only_secret_reference_and_region(self):
+        result = MODULE.configure_provider("moonshot", "connect", "MY_MOONSHOT", "cn")
+        entry = MODULE.load_config()["providers"]["moonshot"]
+        self.assertEqual(entry, {"enabled": True, "secretKey": "MY_MOONSHOT", "region": "cn"})
+        self.assertTrue(next(p for p in result["providers"] if p["id"] == "moonshot")["enabled"])
+
+    def test_invalid_connection_does_not_write_config(self):
+        for provider, name, region in [("moonshot", "sk-secret-value!", "global"), ("moonshot", "KEY", "unknown"), ("codex", "KEY", "global")]:
+            with self.assertRaises(MODULE.SyncError):
+                MODULE.configure_provider(provider, "connect", name, region)
+        self.assertFalse(MODULE.CONFIG.exists())
+
+    def test_new_provider_missing_secret_isolated(self):
+        config = MODULE.load_config()
+        for p in config["providers"]:
+            config["providers"][p]["enabled"] = p == "openrouter"
+        with patch.object(MODULE, "auth_file_key", return_value=""), patch.object(MODULE, "cached_key", return_value=("", "")), \
+             patch.object(MODULE, "RUNTIME_DIR", self.root / "runtime"), \
+             patch.object(MODULE, "fetch_bws_keys", return_value=({}, {"openrouter": "secret OPENROUTER_API_KEY was not found in Bitwarden"})):
+            keys, errors = MODULE.credentials(config)
+        self.assertEqual(keys, {})
+        self.assertEqual(set(errors), {"openrouter"})
+
+
+class CatalogIntegrationTests(unittest.TestCase):
+    setUp = ProviderSettingsTests.setUp
+
+    def test_probe_caches_success_and_honors_retry_after(self):
+        result = ([MODULE.limit_row("Weekly", 25, "")], [], "Code")
+        with patch.object(MODULE, "collect_catalog_provider", return_value=result) as collect:
+            MODULE.catalog_probe("kimi-code", "test-key")
+            MODULE.catalog_probe("kimi-code", "test-key")
+            collect.assert_called_once()
+        with patch.object(MODULE, "collect_catalog_provider", side_effect=MODULE.SyncError("rate limited", 1200)) as collect:
+            for _ in range(2):
+                with self.assertRaises(MODULE.SyncError):
+                    MODULE.catalog_probe("minimax", "test-key")
+            collect.assert_called_once()
+        self.assertGreater(MODULE.live_limits_state()["catalog:minimax:global"]["retryAt"], time.time() + 1190)
+
+    def test_sync_integrates_new_quota_and_keeps_it_on_failure(self):
+        MODULE.atomic_json(MODULE.CONFIG, {"providers": {p: {"enabled": p == "openrouter"} for p in MODULE.PROVIDERS}})
+        result = ([MODULE.limit_row("Key budget (USD)", 25, "")], [], "API")
+        with patch.object(MODULE, "opencode_ledger", return_value={p: MODULE.empty_harness_ledger() for p in MODULE.API_PROVIDERS}), \
+             patch.object(MODULE, "pi_ledger", return_value={}), \
+             patch.object(MODULE, "claude_ledger", return_value={}), \
+             patch.object(MODULE, "codex_ledger", return_value={}), \
+             patch.object(MODULE, "credentials", return_value=({"openrouter": "test-key"}, {})), \
+             patch.object(MODULE, "catalog_probe", return_value=result) as collect:
+            fresh = MODULE.sync()["providers"][0]
+            self.assertEqual(fresh["limits"][0]["percent"], 25)
+            self.assertEqual(fresh["limitsSource"], "live")
+            collect.side_effect = MODULE.SyncError("rate limited")
+            stale = MODULE.sync()["providers"][0]
+            self.assertEqual(stale["limits"][0]["percent"], 25)
+            self.assertTrue(stale["stale"])
+            self.assertNotIn("test-key", MODULE.CACHE.read_text())
+
+    def test_api_ledger_attribution_excludes_subscription_harnesses(self):
+        helpers = PiLedgerTests()
+        ledger = helpers._ledger({"test.jsonl": [
+            helpers._turn("2026-10-24T10:00:00Z", provider=p, cost=1) for p in
+            ("openrouter", "kimi-coding", "moonshot", "minimax-coding-plan", "openai", "google", "openai-codex", "google-gemini-cli")]})
+        for p in ("openrouter", "kimi-code", "moonshot", "minimax", "openai-api", "gemini"):
+            self.assertEqual(ledger[p]["total"]["requests"], 1)
+            self.assertEqual(ledger[p]["total"]["cost"], 1)
+
+    def test_opencode_attributes_new_api_providers(self):
+        import sqlite3
+        database = self.root / "opencode/opencode.db"
+        database.parent.mkdir()
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE message (data TEXT, time_created INTEGER)")
+            for provider in ("openrouter", "kimi-for-coding", "moonshotai", "minimax-coding-plan", "openai", "google", "openai-codex", "google-gemini-cli"):
+                message = {"role": "assistant", "providerID": provider, "modelID": "unknown", "tokens": {"input": 100}, "cost": 0.1}
+                connection.execute("INSERT INTO message VALUES (?, ?)", (json.dumps(message), int(time.time() * 1000)))
+        with patch.object(MODULE, "DATA_HOME", self.root):
+            ledger = MODULE.opencode_ledger({"pricing": {}})
+        for p in ("openrouter", "kimi-code", "moonshot", "minimax", "openai-api", "gemini"):
+            self.assertEqual(ledger[p]["total"]["requests"], 1)
+            self.assertEqual(ledger[p]["total"]["cost"], 0.1)
